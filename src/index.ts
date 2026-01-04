@@ -1,6 +1,9 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import compression from "compression";
 import path from "path";
 import fs from "fs";
 import http from "http";
@@ -20,7 +23,32 @@ import bcrypt from "bcrypt";
 
 const prisma = new PrismaClient();
 
+function parseCorsOrigins(): string[] | null {
+  const raw = (process.env.CORS_ORIGINS || "").trim();
+  if (!raw) return null;
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function corsOptions() {
+  const allowed = parseCorsOrigins();
+  return {
+    credentials: false,
+    origin: (origin: string | undefined, cb: (err: any, allow?: boolean) => void) => {
+      // React Native requests often have no Origin header.
+      if (!origin) return cb(null, true);
+      if (!allowed) return cb(null, true); // dev default
+      return cb(null, allowed.includes(origin));
+    },
+  } as const;
+}
+
 async function ensureSuperAdmin() {
+  if (String(process.env.SEED_SUPERADMIN || "").toLowerCase() !== "true") {
+    return;
+  }
   const email = process.env.SUPER_ADMIN_EMAIL || "superadmin@tapsoran.az";
   const password = process.env.SUPER_ADMIN_PASSWORD || "TapSoran@12345";
   const fullName = process.env.SUPER_ADMIN_NAME || "TapSoran Super Admin";
@@ -48,14 +76,37 @@ async function ensureSuperAdmin() {
 }
 
 const app = express();
-app.use(cors({ origin: true, credentials: true }));
-app.use(express.json());
+app.set("trust proxy", 1);
+
+app.use(helmet());
+app.use(compression());
+
+// CORS (safe default for mobile + optional allowlist for web/admin)
+app.use(cors(corsOptions()));
+
+// Reasonable body limits for APIs
+app.use(express.json({ limit: "1mb" }));
+
+// Basic rate limiting (especially useful for auth endpoints)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use("/auth", authLimiter);
 
 const uploadDir = process.env.UPLOAD_DIR || "uploads";
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 app.use("/uploads", express.static(path.resolve(uploadDir)));
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/health", (_req, res) => {
+  return res.json({
+    ok: true,
+    env: process.env.NODE_ENV || "development",
+    time: new Date().toISOString(),
+  });
+});
 
 app.use("/auth", authRouter(prisma));
 app.use("/categories", categoriesRouter(prisma));
@@ -69,7 +120,22 @@ app.use("/admin", requireSuperAdmin, adminRouter(prisma));
 
 const server = http.createServer(app);
 
-const io = new IOServer(server, { cors: { origin: true, credentials: true } });
+// Socket CORS: allow mobile (no Origin) and optional allowlist for web/admin
+const ioAllowed = parseCorsOrigins();
+const io = new IOServer(server, {
+  cors: {
+    origin: ioAllowed ?? true,
+    credentials: false,
+  },
+});
+
+// Minimal error handler to avoid leaking stack traces in production
+app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  const status = Number(err?.status || err?.statusCode || 500);
+  const message = status >= 500 ? "Server xətası" : String(err?.message || "Xəta");
+  if (status >= 500) console.error("Unhandled error:", err);
+  res.status(status).json({ error: message });
+});
 
 io.use(async (socket, next) => {
   try {

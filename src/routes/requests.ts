@@ -117,15 +117,37 @@ export function requestsRouter(prisma: PrismaClient) {
     // Send push to buyer (if token exists)
     const buyer = await prisma.user.findUnique({
       where: { id: reqRow.buyerId },
-      select: { expoPushToken: true },
+      select: { expoPushToken: true, pushEnabled: true, pushSoundEnabled: true, pushSound: true },
     });
-    await sendExpoPush(buyer?.expoPushToken, notif.title, notif.body, {
-      type: "REQUEST_ACCEPTED",
+    const pushEnabled = buyer?.pushEnabled !== false && !!buyer?.expoPushToken;
+    if (pushEnabled) {
+      const channelId =
+        !buyer!.pushSoundEnabled
+          ? "silent"
+          : buyer!.pushSound === "CHIME"
+            ? "sound_chime"
+            : buyer!.pushSound === "DING"
+              ? "sound_ding"
+              : buyer!.pushSound === "POP"
+                ? "sound_pop"
+                : "default";
+      const sound =
+        !buyer!.pushSoundEnabled
+          ? null
+          : buyer!.pushSound === "CHIME"
+            ? "chime.wav"
+            : buyer!.pushSound === "DING"
+              ? "ding.wav"
+              : buyer!.pushSound === "POP"
+                ? "pop.wav"
+                : "default";
+      await sendExpoPush(buyer!.expoPushToken, notif.title, notif.body, {
+type: "REQUEST_ACCEPTED",
       requestId,
       conversationId: accepted.conversation?.id,
-    });
-
-    // Notify buyer
+      }, { sound, channelId });
+    }
+// Notify buyer
     const io = req.app.get("io");
     if (io) {
       io.to(`user:${reqRow.buyerId}`).emit("request_accepted", accepted);

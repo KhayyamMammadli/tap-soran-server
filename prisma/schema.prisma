@@ -18,6 +18,14 @@ enum RequestScope {
   CATEGORY_SELLERS
 }
 
+
+
+enum NotificationSound {
+  DEFAULT
+  CHIME
+  DING
+  POP
+}
 model Category {
   id       String   @id @default(cuid())
   name     String   @unique
@@ -37,6 +45,11 @@ model User {
   /// (Optional: user may never grant permissions.)
   expoPushToken String?
 
+  // Push notification preferences
+  pushEnabled      Boolean           @default(true)
+  pushSoundEnabled Boolean           @default(true)
+  pushSound        NotificationSound @default(DEFAULT)
+
   categoryId   String?
   category     Category? @relation(fields: [categoryId], references: [id])
 
@@ -44,7 +57,7 @@ model User {
   acceptedRequests   AcceptedRequest[]
   conversationsA     Conversation[]    @relation("ConvA")
   conversationsB     Conversation[]    @relation("ConvB")
-messages           Message[]
+  messages           Message[]
   notifications      Notification[]
 
   blocked       Boolean   @default(false)

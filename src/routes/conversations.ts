@@ -101,16 +101,38 @@ export function conversationsRouter(prisma: PrismaClient) {
 
     const receiver = await prisma.user.findUnique({
       where: { id: receiverId },
-      select: { expoPushToken: true },
+      select: { expoPushToken: true, pushEnabled: true, pushSoundEnabled: true, pushSound: true },
     });
 
-    await sendExpoPush(receiver?.expoPushToken, notif.title, notif.body, {
-      type: "MESSAGE",
+    const pushEnabled = receiver?.pushEnabled !== false && !!receiver?.expoPushToken;
+    if (pushEnabled) {
+      const channelId =
+        !receiver!.pushSoundEnabled
+          ? "silent"
+          : receiver!.pushSound === "CHIME"
+            ? "sound_chime"
+            : receiver!.pushSound === "DING"
+              ? "sound_ding"
+              : receiver!.pushSound === "POP"
+                ? "sound_pop"
+                : "default";
+      const sound =
+        !receiver!.pushSoundEnabled
+          ? null
+          : receiver!.pushSound === "CHIME"
+            ? "chime.wav"
+            : receiver!.pushSound === "DING"
+              ? "ding.wav"
+              : receiver!.pushSound === "POP"
+                ? "pop.wav"
+                : "default";
+      await sendExpoPush(receiver!.expoPushToken, notif.title, notif.body, {
+type: "MESSAGE",
       conversationId: id,
       senderId: req.user.id,
-    });
-
-    const io = req.app.get("io");
+      }, { sound, channelId });
+    }
+const io = req.app.get("io");
     if (io) {
       io.to(`user:${conv.userAId}`).to(`user:${conv.userBId}`).emit("new_message", msg);
       io.to(`user:${receiverId}`).emit("new_notification", notif);

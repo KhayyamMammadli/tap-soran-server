@@ -2,7 +2,8 @@ type ExpoPushMessage = {
   to: string;
   title: string;
   body: string;
-  sound?: "default";
+  sound?: string | null;
+  channelId?: string;
   data?: Record<string, any>;
 };
 
@@ -13,7 +14,7 @@ function looksLikeExpoToken(token: string) {
   return token.startsWith("ExponentPushToken[") || token.startsWith("ExpoPushToken[");
 }
 
-export async function sendExpoPush(to: string | null | undefined, title: string, body: string, data?: Record<string, any>) {
+export async function sendExpoPush(to: string | null | undefined, title: string, body: string, data?: Record<string, any>, opts?: { sound?: string | null; channelId?: string }) {
   if (!to) return;
   if (!looksLikeExpoToken(to)) return;
 
@@ -21,8 +22,9 @@ export async function sendExpoPush(to: string | null | undefined, title: string,
     to,
     title,
     body,
-    sound: "default",
-    data,
+    sound: opts?.sound ?? undefined,
+      channelId: opts?.channelId,
+      data,
   };
 
   try {
