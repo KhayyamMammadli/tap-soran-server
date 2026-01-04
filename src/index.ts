@@ -19,7 +19,7 @@ import { adminRouter } from "./routes/admin";
 import { requireSuperAdmin } from "./middleware/requireSuperAdmin";
 import { authMiddleware } from "./middleware/auth";
 import { verifyToken } from "./utils/jwt";
-import bcrypt from "bcrypt";
+import bcrypt from "bcryptjs";
 
 const prisma = new PrismaClient();
 

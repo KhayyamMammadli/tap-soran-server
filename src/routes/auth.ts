@@ -1,6 +1,6 @@
 import { PrismaClient, Role } from "@prisma/client";
 import { Router } from "express";
-import bcrypt from "bcrypt";
+import bcrypt from "bcryptjs";
 import { z } from "zod";
 import { signToken } from "../utils/jwt";
 
