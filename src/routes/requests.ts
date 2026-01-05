@@ -1,4 +1,4 @@
-import { PrismaClient, RequestScope } from "@prisma/client";
+import { MessageType, PrismaClient, RequestScope } from "@prisma/client";
 import { Router } from "express";
 import { z } from "zod";
 import multer from "multer";
@@ -33,7 +33,7 @@ export function requestsRouter(prisma: PrismaClient) {
         imageUrl,
         buyerId: req.user.id,
       },
-      include: { category: true, buyer: { select: { id: true, fullName: true } } },
+      include: { category: true, buyer: { select: { id: true, fullName: true, avatarUrl: true } } },
     });
 
     // socket notification
@@ -67,7 +67,7 @@ export function requestsRouter(prisma: PrismaClient) {
           { scope: "CATEGORY_SELLERS", categoryId: req.user.categoryId || "__none__" },
         ],
       },
-      include: { category: true, buyer: { select: { id: true, fullName: true } }, accepted: true },
+      include: { category: true, buyer: { select: { id: true, fullName: true, avatarUrl: true } }, accepted: true },
       orderBy: { createdAt: "desc" },
       take,
       skip,
@@ -103,6 +103,25 @@ export function requestsRouter(prisma: PrismaClient) {
       },
       include: { conversation: true, request: true },
     });
+
+    // Add a SYSTEM message to make the chat context obvious
+    if (accepted.conversation) {
+      const systemText = `Sorğu: ${reqRow.title}`;
+      const sys = await prisma.message.create({
+        data: {
+          conversationId: accepted.conversation.id,
+          senderId: req.user.id,
+          type: MessageType.SYSTEM,
+          text: systemText,
+          mediaUrl: reqRow.imageUrl ?? null,
+        },
+      });
+
+      const io = req.app.get("io");
+      if (io) {
+        io.to(`user:${reqRow.buyerId}`).to(`user:${req.user.id}`).emit("new_message", sys);
+      }
+    }
 
     // Create notification for buyer (in-app) + push
     const notif = await prisma.notification.create({
@@ -141,13 +160,20 @@ export function requestsRouter(prisma: PrismaClient) {
               : buyer!.pushSound === "POP"
                 ? "pop.wav"
                 : "default";
-      await sendExpoPush(buyer!.expoPushToken, notif.title, notif.body, {
-type: "REQUEST_ACCEPTED",
-      requestId,
-      conversationId: accepted.conversation?.id,
-      }, { sound, channelId });
+      await sendExpoPush(
+        buyer!.expoPushToken,
+        notif.title,
+        notif.body,
+        {
+          type: "REQUEST_ACCEPTED",
+          requestId,
+          conversationId: accepted.conversation?.id,
+        },
+        { sound, channelId }
+      );
     }
-// Notify buyer
+
+    // Notify buyer
     const io = req.app.get("io");
     if (io) {
       io.to(`user:${reqRow.buyerId}`).emit("request_accepted", accepted);

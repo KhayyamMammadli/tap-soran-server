@@ -43,7 +43,7 @@ r.post("/register", async (req, res) => {
         passwordHash,
         categoryId: role === "SELLER" ? categoryId! : null,
       },
-      select: { id: true, role: true, fullName: true, email: true, tip: true, categoryId: true },
+      select: { id: true, role: true, fullName: true, email: true, tip: true, categoryId: true, avatarUrl: true },
     });
 
     const token = signToken(user.id);
@@ -85,6 +85,7 @@ if (user.role !== "SUPER_ADMIN") {
         email: user.email,
         tip: user.tip,
         categoryId: user.categoryId,
+        avatarUrl: (user as any).avatarUrl ?? null,
       },
       token,
     });
