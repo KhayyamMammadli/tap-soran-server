@@ -76,6 +76,16 @@ export function adminRouter(prisma: PrismaClient) {
       },
     });
 
+    // Kick the user out immediately (mobile/web)
+    try {
+      const io = req.app.get("io");
+      io?.to?.(`user:${targetId}`)?.emit?.("userBlocked", {
+        reason: parsed.data.reason,
+        blockedAt: new Date().toISOString(),
+      });
+      io?.in?.(`user:${targetId}`)?.disconnectSockets?.(true);
+    } catch {}
+
     return res.json(user);
   });
 
@@ -110,6 +120,13 @@ export function adminRouter(prisma: PrismaClient) {
         type: "INFO",
       },
     });
+
+    try {
+      const io = req.app.get("io");
+      io?.to?.(`user:${targetId}`)?.emit?.("userUnblocked", {
+        unblockedAt: new Date().toISOString(),
+      });
+    } catch {}
 
     return res.json(user);
   });

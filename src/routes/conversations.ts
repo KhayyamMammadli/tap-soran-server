@@ -5,6 +5,7 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 import { clip, sendExpoPush } from "../utils/push";
+import { censorAzVulgar, hasAzVulgar } from "../utils/moderation";
 
 function ensureDir(p: string) {
   if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
@@ -149,6 +150,11 @@ export function conversationsRouter(prisma: PrismaClient) {
       let mediaDuration: number | null = null;
       let finalText: string | null = null;
 
+      // Vulgarity moderation (server-side). We store a masked version of the text.
+      // Client-side checks can be bypassed, so server enforcement is required.
+      let vulgarDetected = false;
+      let vulgarOriginal: string | null = null;
+
       if (img) {
         type = MessageType.IMAGE;
         mediaUrl = `/uploads/chat/images/${img.filename}`;
@@ -171,6 +177,14 @@ export function conversationsRouter(prisma: PrismaClient) {
         finalText = text;
       }
 
+      // Apply server-side profanity masking for any user-provided text
+      // (plain text messages and optional captions).
+      if (finalText && hasAzVulgar(finalText)) {
+        vulgarDetected = true;
+        vulgarOriginal = finalText;
+        finalText = censorAzVulgar(finalText);
+      }
+
       const msg = await prisma.message.create({
         data: {
           conversationId: id,
@@ -182,6 +196,39 @@ export function conversationsRouter(prisma: PrismaClient) {
           mediaDuration,
         },
       });
+
+      // If we detected vulgarity, create a SYSTEM warning message in the chat
+      // and notify SUPER_ADMIN users.
+      let systemMsg: any = null;
+      const adminNotifs: Array<{ adminId: string; notif: any }> = [];
+      if (vulgarDetected) {
+        systemMsg = await prisma.message.create({
+          data: {
+            conversationId: id,
+            senderId: req.user.id,
+            type: MessageType.SYSTEM,
+            text: "⚠️ Vulqar ifadə aşkarlandı. Davam etsəniz hesabınız blok olunacaq.",
+          },
+        });
+
+        const admins = await prisma.user.findMany({
+          where: { role: "SUPER_ADMIN" },
+          select: { id: true },
+        });
+
+        const offendingPreview = clip(censorAzVulgar(vulgarOriginal || ""));
+        for (const a of admins) {
+          const n = await prisma.notification.create({
+            data: {
+              userId: a.id,
+              title: "Vulqar söz aşkarlandı",
+              body: clip(`${req.user.fullName}: ${offendingPreview}`),
+              type: "ADMIN_VULGAR",
+            },
+          });
+          adminNotifs.push({ adminId: a.id, notif: n });
+        }
+      }
 
       // Determine receiver
       const receiverId = conv.userAId === req.user.id ? conv.userBId : conv.userAId;
@@ -248,7 +295,14 @@ export function conversationsRouter(prisma: PrismaClient) {
       const io = req.app.get("io");
       if (io) {
         io.to(`user:${conv.userAId}`).to(`user:${conv.userBId}`).emit("new_message", msg);
+        if (systemMsg) {
+          io.to(`user:${conv.userAId}`).to(`user:${conv.userBId}`).emit("new_message", systemMsg);
+        }
         io.to(`user:${receiverId}`).emit("new_notification", notif);
+
+        for (const a of adminNotifs) {
+          io.to(`user:${a.adminId}`).emit("new_notification", a.notif);
+        }
       }
 
       res.json(msg);

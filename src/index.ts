@@ -145,6 +145,7 @@ io.use(async (socket, next) => {
     const payload = verifyToken(token);
     const user = await prisma.user.findUnique({ where: { id: payload.userId } });
     if (!user) return next(new Error("User not found"));
+    if ((user as any).blocked) return next(new Error("Blocked"));
 
     (socket as any).user = user;
     next();
