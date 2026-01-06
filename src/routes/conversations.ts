@@ -197,6 +197,98 @@ export function conversationsRouter(prisma: PrismaClient) {
         finalText = censorAzVulgar(finalText);
       }
 
+      // Escalate vulgarity violations (server-side)
+      // Policy: 1st = warning; 2nd = 24h freeze; 3rd = block + force logout
+      if (vulgarDetected) {
+        const strike = (sender.moderationStrikes || 0) + 1;
+        const reasonLabel = "Vulqar ifadə";
+
+        const sys = await prisma.$transaction(async (tx) => {
+          await tx.moderationEvent.create({
+            data: {
+              userId: sender.id,
+              conversationId: id,
+              messageText: (vulgarOriginal || '').slice(0, 500),
+              reasonCode: 'VULGAR',
+            },
+          });
+
+          if (strike >= 3) {
+            await tx.user.update({
+              where: { id: sender.id },
+              data: {
+                moderationStrikes: strike,
+                blocked: true,
+                blockedReason: `Təhlükəsizlik qaydalarının pozulması: ${reasonLabel}` ,
+                blockedAt: new Date(),
+                tokenVersion: { increment: 1 },
+              },
+            });
+          } else if (strike == 2) {
+            await tx.user.update({
+              where: { id: sender.id },
+              data: {
+                moderationStrikes: strike,
+                chatFrozenUntil: new Date(Date.now() + 24 * 60 * 60 * 1000),
+              },
+            });
+          } else {
+            await tx.user.update({ where: { id: sender.id }, data: { moderationStrikes: strike } });
+          }
+
+          const sysMsg = await tx.message.create({
+            data: {
+              conversationId: id,
+              senderId: sender.id,
+              type: MessageType.SYSTEM,
+              text:
+                strike >= 3
+                  ? `⛔ Hesab bloklandı. Səbəb: ${reasonLabel}`
+                  : strike === 2
+                    ? `⛔ Vulqar ifadə aşkarlandı. Çat 24 saatlıq donduruldu.`
+                    : `⚠️ Vulqar ifadə aşkarlandı. Davam etsəniz hesabınız bloklana bilər.`,
+            },
+          });
+
+          return sysMsg;
+        });
+
+        // Notify super admins
+        const admins = await prisma.user.findMany({ where: { role: 'SUPER_ADMIN' }, select: { id: true } });
+        const offendingPreview = clip(censorAzVulgar(vulgarOriginal || ''));
+        const adminNotifs: Array<{ adminId: string; notif: any }> = [];
+        for (const a of admins) {
+          const n = await prisma.notification.create({
+            data: {
+              userId: a.id,
+              title: 'Vulqar söz aşkarlandı',
+              body: clip(`${sender.fullName}: ${offendingPreview}`),
+              type: 'ADMIN_VULGAR',
+            },
+          });
+          adminNotifs.push({ adminId: a.id, notif: n });
+        }
+
+        // Socket updates
+        const io = req.app.get('io');
+        if (io) {
+          try {
+            io.to(`user:${conv.userAId}`).to(`user:${conv.userBId}`).emit('new_message', sys);
+          } catch {}
+          for (const a of adminNotifs) io.to(`user:${a.adminId}`).emit('new_notification', a.notif);
+
+          const u = await prisma.user.findUnique({ where: { id: sender.id }, select: { blocked: true, blockedReason: true, blockedAt: true, chatFrozenUntil: true } });
+          if (u?.blocked) {
+            io.to(`user:${sender.id}`).emit('userBlocked', { reason: u.blockedReason, blockedAt: u.blockedAt?.toISOString() });
+            io.in(`user:${sender.id}`).disconnectSockets(true);
+          } else if (u?.chatFrozenUntil) {
+            io.to(`user:${sender.id}`).emit('chatFrozen', { until: u.chatFrozenUntil.toISOString(), reason: reasonLabel });
+          }
+        }
+
+        return res.status(422).json({ error: 'MessageBlocked', reasonCode: 'VULGAR', reason: reasonLabel });
+      }
+
       // Safety moderation: block illegal trade/contact/link content (server-side)
       if (finalText) {
         const safety = checkChatSafety(finalText);
