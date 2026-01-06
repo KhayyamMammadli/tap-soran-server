@@ -32,6 +32,11 @@ enum MessageType {
   SYSTEM
 }
 
+enum LegalPageType {
+  PRIVACY
+  TERMS
+}
+
 model Category {
   id       String   @id @default(cuid())
   name     String   @unique
@@ -127,6 +132,19 @@ model ModerationEvent {
 
   @@index([userId])
   @@index([reasonCode])
+}
+
+model LegalPage {
+  id        String        @id @default(cuid())
+  type      LegalPageType @unique
+  title     String
+  /// Stored as HTML (recommended) or plain text.
+  content   String
+  updatedAt DateTime      @updatedAt
+  createdAt DateTime      @default(now())
+  updatedById String?
+
+  @@index([type])
 }
 
 model Request {

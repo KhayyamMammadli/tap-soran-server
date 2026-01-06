@@ -17,6 +17,7 @@ import { notificationsRouter } from "./routes/notifications";
 import { meRouter } from "./routes/me";
 import { adminRouter } from "./routes/admin";
 import { reportsRouter } from "./routes/reports";
+import { legalRouter } from "./routes/legal";
 import { requireSuperAdmin } from "./middleware/requireSuperAdmin";
 import { authMiddleware } from "./middleware/auth";
 import { verifyToken } from "./utils/jwt";
@@ -111,6 +112,7 @@ app.get("/health", (_req, res) => {
 
 app.use("/auth", authRouter(prisma));
 app.use("/categories", categoriesRouter(prisma));
+app.use("/legal", legalRouter(prisma));
 
 app.use(authMiddleware(prisma));
 app.use("/requests", requestsRouter(prisma));

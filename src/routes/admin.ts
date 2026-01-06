@@ -5,6 +5,42 @@ import { z } from "zod";
 export function adminRouter(prisma: PrismaClient) {
   const r = Router();
 
+  // Legal pages (Privacy Policy / Terms) editable from admin.
+  const legalType = z.enum(["PRIVACY", "TERMS"]);
+  r.get("/legal/:type", async (req, res) => {
+    const parsed = legalType.safeParse(String(req.params.type || "").toUpperCase());
+    if (!parsed.success) return res.status(400).json({ error: "Invalid type" });
+
+    const page = await prisma.legalPage.findUnique({ where: { type: parsed.data as any } });
+    return res.json(page);
+  });
+
+  const legalUpdateSchema = z.object({ title: z.string().min(2).max(200), content: z.string().min(10) });
+  r.put("/legal/:type", async (req, res) => {
+    const parsedType = legalType.safeParse(String(req.params.type || "").toUpperCase());
+    if (!parsedType.success) return res.status(400).json({ error: "Invalid type" });
+
+    const body = legalUpdateSchema.safeParse(req.body);
+    if (!body.success) return res.status(400).json({ error: body.error.flatten() });
+
+    const updated = await prisma.legalPage.upsert({
+      where: { type: parsedType.data as any },
+      create: {
+        type: parsedType.data as any,
+        title: body.data.title,
+        content: body.data.content,
+        updatedById: req.user!.id,
+      },
+      update: {
+        title: body.data.title,
+        content: body.data.content,
+        updatedById: req.user!.id,
+      },
+    });
+
+    return res.json(updated);
+  });
+
   // Moderation / safety dashboard
   r.get("/risk-users", async (_req, res) => {
     const users = await prisma.user.findMany({
