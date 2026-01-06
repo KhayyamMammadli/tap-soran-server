@@ -6,6 +6,7 @@ import path from "path";
 import fs from "fs";
 import { clip, sendExpoPush } from "../utils/push";
 import { censorAzVulgar, hasAzVulgar } from "../utils/moderation";
+import { checkChatSafety, humanizeSafetyReason } from "../utils/safety";
 
 function ensureDir(p: string) {
   if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
@@ -131,7 +132,18 @@ export function conversationsRouter(prisma: PrismaClient) {
     async (req, res) => {
       if (!req.user) return res.status(401).json({ error: "Unauthorized" });
 
+      // Check if sender's chat is temporarily frozen
       const id = req.params.id;
+
+      const sender = await prisma.user.findUnique({
+        where: { id: req.user.id },
+        select: { id: true, fullName: true, chatFrozenUntil: true, moderationStrikes: true, blocked: true },
+      });
+      if (!sender) return res.status(401).json({ error: "Unauthorized" });
+      if ((sender as any).blocked) return res.status(403).json({ error: "Blocked" });
+      if (sender.chatFrozenUntil && sender.chatFrozenUntil.getTime() > Date.now()) {
+        return res.status(423).json({ error: "ChatFrozen", until: sender.chatFrozenUntil.toISOString() });
+      }
 
       const conv = await prisma.conversation.findUnique({ where: { id } });
       if (!conv) return res.status(404).json({ error: "Not found" });
@@ -183,6 +195,110 @@ export function conversationsRouter(prisma: PrismaClient) {
         vulgarDetected = true;
         vulgarOriginal = finalText;
         finalText = censorAzVulgar(finalText);
+      }
+
+      // Safety moderation: block illegal trade/contact/link content (server-side)
+      if (finalText) {
+        const safety = checkChatSafety(finalText);
+        if (!safety.ok) {
+          // Log event + strike escalation
+          const strike = (sender.moderationStrikes || 0) + 1;
+          const reasonLabel = humanizeSafetyReason(safety.code);
+
+          const sys = await prisma.$transaction(async (tx) => {
+            await tx.moderationEvent.create({
+              data: {
+                userId: sender.id,
+                conversationId: id,
+                messageText: finalText.slice(0, 500),
+                reasonCode: safety.code,
+              },
+            });
+
+            // Escalation policy: 1st = warning; 2nd = 24h freeze; 3rd = block
+            if (strike >= 3) {
+              await tx.user.update({
+                where: { id: sender.id },
+                data: {
+                  moderationStrikes: strike,
+                  blocked: true,
+                  blockedReason: `Təhlükəsizlik qaydalarının pozulması: ${reasonLabel}`,
+                  blockedAt: new Date(),
+                  tokenVersion: { increment: 1 },
+                },
+              });
+            } else if (strike === 2) {
+              await tx.user.update({
+                where: { id: sender.id },
+                data: {
+                  moderationStrikes: strike,
+                  chatFrozenUntil: new Date(Date.now() + 24 * 60 * 60 * 1000),
+                },
+              });
+            } else {
+              await tx.user.update({ where: { id: sender.id }, data: { moderationStrikes: strike } });
+            }
+
+            // Insert a SYSTEM warning into the conversation
+            const sysMsg = await tx.message.create({
+              data: {
+                conversationId: id,
+                senderId: sender.id,
+                type: MessageType.SYSTEM,
+                text:
+                  strike >= 3
+                    ? `⛔ Hesab bloklandı. Səbəb: ${reasonLabel}`
+                    : strike === 2
+                      ? `⛔ Qadağan olunmuş məzmun aşkarlandı (${reasonLabel}). Çat 24 saatlıq donduruldu.`
+                      : `⚠️ Qadağan olunmuş məzmun aşkarlandı (${reasonLabel}). Təkrar etsəniz hesabınız bloklana bilər.`,
+              },
+            });
+
+            return sysMsg;
+          });
+
+          // Emit the SYSTEM warning into the live chat
+          const ioLive = req.app.get("io");
+          try {
+            ioLive?.to?.(`user:${conv.userAId}`)?.to?.(`user:${conv.userBId}`)?.emit?.("new_message", sys);
+          } catch {}
+
+          // Notify super admins
+          const admins = await prisma.user.findMany({ where: { role: "SUPER_ADMIN" }, select: { id: true } });
+          const offendingPreview = clip(finalText);
+          const adminNotifs: Array<{ adminId: string; notif: any }> = [];
+          for (const a of admins) {
+            const n = await prisma.notification.create({
+              data: {
+                userId: a.id,
+                title: "Chat təhlükəsizlik xəbərdarlığı",
+                body: clip(`${sender.fullName}: ${reasonLabel} • ${offendingPreview}`),
+                type: "ADMIN_SAFETY",
+              },
+            });
+            adminNotifs.push({ adminId: a.id, notif: n });
+          }
+
+          // Socket updates (kick on block, or inform freeze)
+          const io = req.app.get("io");
+          if (io) {
+            // deliver system warning to both participants
+            try {
+              io.to(`user:${conv.userAId}`).to(`user:${conv.userBId}`).emit("new_message", sys);
+            } catch {}
+            for (const a of adminNotifs) io.to(`user:${a.adminId}`).emit("new_notification", a.notif);
+            // Re-read sender to know if blocked/frozen
+            const u = await prisma.user.findUnique({ where: { id: sender.id }, select: { blocked: true, blockedReason: true, blockedAt: true, chatFrozenUntil: true } });
+            if (u?.blocked) {
+              io.to(`user:${sender.id}`).emit("userBlocked", { reason: u.blockedReason, blockedAt: u.blockedAt?.toISOString() });
+              io.in(`user:${sender.id}`).disconnectSockets(true);
+            } else if (u?.chatFrozenUntil) {
+              io.to(`user:${sender.id}`).emit("chatFrozen", { until: u.chatFrozenUntil.toISOString(), reason: reasonLabel });
+            }
+          }
+
+          return res.status(422).json({ error: "MessageBlocked", reasonCode: safety.code, reason: reasonLabel });
+        }
       }
 
       const msg = await prisma.message.create({

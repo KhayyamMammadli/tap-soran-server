@@ -43,10 +43,10 @@ r.post("/register", async (req, res) => {
         passwordHash,
         categoryId: role === "SELLER" ? categoryId! : null,
       },
-      select: { id: true, role: true, fullName: true, email: true, tip: true, categoryId: true, avatarUrl: true },
+      select: { id: true, role: true, fullName: true, email: true, tip: true, categoryId: true, avatarUrl: true, tokenVersion: true },
     });
 
-    const token = signToken(user.id);
+    const token = signToken(user.id, user.tokenVersion);
     res.json({ user, token });
   });
 
@@ -76,7 +76,7 @@ if (user.role !== "SUPER_ADMIN") {
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
-    const token = signToken(user.id);
+    const token = signToken(user.id, (user as any).tokenVersion || 0);
     res.json({
       user: {
         id: user.id,

@@ -16,6 +16,7 @@ import { conversationsRouter } from "./routes/conversations";
 import { notificationsRouter } from "./routes/notifications";
 import { meRouter } from "./routes/me";
 import { adminRouter } from "./routes/admin";
+import { reportsRouter } from "./routes/reports";
 import { requireSuperAdmin } from "./middleware/requireSuperAdmin";
 import { authMiddleware } from "./middleware/auth";
 import { verifyToken } from "./utils/jwt";
@@ -114,6 +115,7 @@ app.use("/categories", categoriesRouter(prisma));
 app.use(authMiddleware(prisma));
 app.use("/requests", requestsRouter(prisma));
 app.use("/conversations", conversationsRouter(prisma));
+app.use("/reports", reportsRouter(prisma));
 app.use("/notifications", authMiddleware(prisma, { allowBlocked: true }), notificationsRouter(prisma));
 app.use("/me", authMiddleware(prisma, { allowBlocked: true }), meRouter(prisma));
 app.use("/admin", requireSuperAdmin, adminRouter(prisma));
@@ -145,6 +147,8 @@ io.use(async (socket, next) => {
     const payload = verifyToken(token);
     const user = await prisma.user.findUnique({ where: { id: payload.userId } });
     if (!user) return next(new Error("User not found"));
+    const tv = typeof (payload as any).tv === "number" ? (payload as any).tv : 0;
+    if ((user as any).tokenVersion !== tv) return next(new Error("Unauthorized"));
     if ((user as any).blocked) return next(new Error("Blocked"));
 
     (socket as any).user = user;

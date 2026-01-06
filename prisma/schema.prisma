@@ -69,12 +69,64 @@ model User {
   messages           Message[]
   notifications      Notification[]
 
+  reportsMade        MessageReport[] @relation("ReportBy")
+  reportsReceived    MessageReport[] @relation("ReportTarget")
+  moderationEvents   ModerationEvent[]
+
   blocked       Boolean   @default(false)
   blockedReason String?
   blockedAt     DateTime?
   blockedById   String?
 
+  // Security / moderation
+  tokenVersion      Int      @default(0) // increment to invalidate all tokens (force logout)
+  moderationStrikes Int      @default(0)
+  chatFrozenUntil   DateTime?
+  reportCount       Int      @default(0)
+
   createdAt DateTime @default(now())
+}
+
+enum ReportStatus {
+  OPEN
+  RESOLVED
+  DISMISSED
+}
+
+model MessageReport {
+  id             String       @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+
+  messageId      String
+  message        Message      @relation(fields: [messageId], references: [id])
+
+  reporterId     String
+  reporter       User         @relation("ReportBy", fields: [reporterId], references: [id])
+
+  reportedUserId String
+  reportedUser   User         @relation("ReportTarget", fields: [reportedUserId], references: [id])
+
+  reason         String
+  status         ReportStatus @default(OPEN)
+  createdAt      DateTime     @default(now())
+
+  @@unique([reporterId, messageId])
+  @@index([reportedUserId])
+  @@index([status])
+}
+
+model ModerationEvent {
+  id             String   @id @default(cuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id])
+  conversationId String?
+  messageText    String?
+  reasonCode     String
+  createdAt      DateTime @default(now())
+
+  @@index([userId])
+  @@index([reasonCode])
 }
 
 model Request {

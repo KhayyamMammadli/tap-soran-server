@@ -5,6 +5,96 @@ import { z } from "zod";
 export function adminRouter(prisma: PrismaClient) {
   const r = Router();
 
+  // Moderation / safety dashboard
+  r.get("/risk-users", async (_req, res) => {
+    const users = await prisma.user.findMany({
+      orderBy: [{ reportCount: "desc" }, { moderationStrikes: "desc" }, { createdAt: "desc" }],
+      select: {
+        id: true,
+        role: true,
+        fullName: true,
+        email: true,
+        blocked: true,
+        blockedReason: true,
+        blockedAt: true,
+        reportCount: true,
+        moderationStrikes: true,
+        chatFrozenUntil: true,
+        createdAt: true,
+      },
+      take: 200,
+    });
+    return res.json(users);
+  });
+
+  r.get("/reports", async (req, res) => {
+    const status = String(req.query.status || "OPEN").toUpperCase();
+    const rows = await prisma.messageReport.findMany({
+      where: status === "ALL" ? {} : { status: status as any },
+      orderBy: { createdAt: "desc" },
+      include: {
+        reporter: { select: { id: true, fullName: true, email: true } },
+        reportedUser: { select: { id: true, fullName: true, email: true, reportCount: true, blocked: true } },
+        message: { select: { id: true, text: true, createdAt: true } },
+        conversation: { select: { id: true } },
+      },
+      take: 500,
+    });
+    return res.json(rows);
+  });
+
+  const reportStatusSchema = z.object({ status: z.enum(["OPEN", "RESOLVED", "DISMISSED"]) });
+  r.patch("/reports/:id/status", async (req, res) => {
+    const parsed = reportStatusSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+    try {
+      const updated = await prisma.messageReport.update({ where: { id: req.params.id }, data: { status: parsed.data.status as any } });
+      return res.json(updated);
+    } catch (e: any) {
+      return res.status(400).json({ error: e?.message || "Update failed" });
+    }
+  });
+
+  const freezeSchema = z.object({ hours: z.number().int().min(1).max(24 * 30), reason: z.string().min(3).max(200) });
+  r.patch("/users/:id/freeze", async (req, res) => {
+    const parsed = freezeSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+    const targetId = req.params.id;
+    const until = new Date(Date.now() + parsed.data.hours * 60 * 60 * 1000);
+    const user = await prisma.user.update({ where: { id: targetId }, data: { chatFrozenUntil: until } });
+    await prisma.notification.create({
+      data: {
+        userId: targetId,
+        title: "Çat dayandırıldı",
+        body: `Səbəb: ${parsed.data.reason}. ${parsed.data.hours} saat müddətinə mesaj yaza bilməzsiniz.`,
+        type: "CHAT_FROZEN",
+      },
+    });
+    try {
+      const io = req.app.get("io");
+      io?.to?.(`user:${targetId}`)?.emit?.("chatFrozen", { until: until.toISOString(), reason: parsed.data.reason });
+    } catch {}
+    return res.json(user);
+  });
+
+  r.patch("/users/:id/unfreeze", async (req, res) => {
+    const targetId = req.params.id;
+    const user = await prisma.user.update({ where: { id: targetId }, data: { chatFrozenUntil: null } });
+    await prisma.notification.create({
+      data: {
+        userId: targetId,
+        title: "Çat bərpa olundu",
+        body: "Artıq mesaj yaza bilərsiniz.",
+        type: "INFO",
+      },
+    });
+    try {
+      const io = req.app.get("io");
+      io?.to?.(`user:${targetId}`)?.emit?.("chatUnfrozen", { unfreezeAt: new Date().toISOString() });
+    } catch {}
+    return res.json(user);
+  });
+
   // Stats
   r.get("/stats", async (_req, res) => {
     const [users, categories, requests, conversations] = await Promise.all([
@@ -54,6 +144,7 @@ export function adminRouter(prisma: PrismaClient) {
         blockedReason: parsed.data.reason,
         blockedAt: new Date(),
         blockedById: req.user!.id,
+        tokenVersion: { increment: 1 },
       },
       select: {
         id: true,
