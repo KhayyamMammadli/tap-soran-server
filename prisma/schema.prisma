@@ -101,23 +101,23 @@ enum ReportStatus {
 model MessageReport {
   id             String       @id @default(cuid())
   conversationId String
-  conversation   Conversation @relation(fields: [conversationId], references: [id])
+  conversation   Conversation @relation("ConversationMessageReports", fields: [conversationId], references: [id])
 
   messageId      String
-  message        Message      @relation(fields: [messageId], references: [id])
+  message        Message      @relation("MessageMessageReports", fields: [messageId], references: [id])
 
   reporterId     String
   reporter       User         @relation("ReportBy", fields: [reporterId], references: [id])
 
-  reportedUserId String
-  reportedUser   User         @relation("ReportTarget", fields: [reportedUserId], references: [id])
+  targetUserId   String
+  targetUser     User         @relation("ReportTarget", fields: [targetUserId], references: [id])
 
   reason         String
   status         ReportStatus @default(OPEN)
   createdAt      DateTime     @default(now())
 
   @@unique([reporterId, messageId])
-  @@index([reportedUserId])
+  @@index([targetUserId])
   @@index([status])
 }
 
@@ -186,6 +186,9 @@ model Conversation {
   acceptedRequestId String? @unique
   acceptedRequest   AcceptedRequest? @relation(fields: [acceptedRequestId], references: [id])
 
+  // Reports for messages that belong to this conversation
+  messageReports MessageReport[] @relation("ConversationMessageReports")
+
   messages  Message[]
   createdAt DateTime @default(now())
 }
@@ -207,6 +210,9 @@ model Message {
   mediaDuration  Int?
 
   createdAt      DateTime     @default(now())
+
+  // Reports for this message
+  reports MessageReport[] @relation("MessageMessageReports")
 }
 
 model Notification {

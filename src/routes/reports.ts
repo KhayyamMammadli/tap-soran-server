@@ -12,7 +12,9 @@ export function reportsRouter(prisma: PrismaClient) {
 
   // Create a report for a specific message
   r.post("/", async (req, res) => {
+    // Narrow req.user once so TS keeps it inside nested callbacks (e.g. $transaction)
     if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+    const user = req.user;
 
     const parsed = createSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
@@ -21,12 +23,12 @@ export function reportsRouter(prisma: PrismaClient) {
 
     const msg = await prisma.message.findUnique({ where: { id: messageId }, select: { id: true, senderId: true, conversationId: true } });
     if (!msg) return res.status(404).json({ error: "Not found" });
-    if (msg.senderId === req.user.id) return res.status(400).json({ error: "You can't report your own message" });
+    if (msg.senderId === user.id) return res.status(400).json({ error: "You can't report your own message" });
 
     // Ensure reporter is participant
     const conv = await prisma.conversation.findUnique({ where: { id: msg.conversationId }, select: { id: true, userAId: true, userBId: true } });
     if (!conv) return res.status(404).json({ error: "Not found" });
-    if (conv.userAId !== req.user.id && conv.userBId !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+    if (conv.userAId !== user.id && conv.userBId !== user.id) return res.status(403).json({ error: "Forbidden" });
 
     try {
       const report = await prisma.$transaction(async (tx) => {
@@ -34,8 +36,8 @@ export function reportsRouter(prisma: PrismaClient) {
           data: {
             conversationId: msg.conversationId,
             messageId: msg.id,
-            reporterId: req.user.id,
-            reportedUserId: msg.senderId,
+            reporterId: user.id,
+            targetUserId: msg.senderId,
             reason,
           },
         });
@@ -106,7 +108,7 @@ export function reportsRouter(prisma: PrismaClient) {
           data: {
             userId: a.id,
             title: "Yeni şikayət",
-            body: `${req.user.fullName} → ${(target?.fullName ?? "istifadəçi")}: ${reason}`.slice(0, 200),
+            body: `${user.fullName} → ${(target?.fullName ?? "istifadəçi")}: ${reason}`.slice(0, 200),
             type: "ADMIN_REPORT",
           },
         });

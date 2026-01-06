@@ -70,13 +70,15 @@ export function adminRouter(prisma: PrismaClient) {
       orderBy: { createdAt: "desc" },
       include: {
         reporter: { select: { id: true, fullName: true, email: true } },
-        reportedUser: { select: { id: true, fullName: true, email: true, reportCount: true, blocked: true } },
+        targetUser: { select: { id: true, fullName: true, email: true, reportCount: true, blocked: true } },
         message: { select: { id: true, text: true, createdAt: true } },
         conversation: { select: { id: true } },
       },
       take: 500,
     });
-    return res.json(rows);
+    // Backward-compatible shape for older admin UI: expose `reportedUser` too.
+    const normalized = rows.map((r: any) => ({ ...r, reportedUser: r.reportedUser ?? r.targetUser }));
+    return res.json(normalized);
   });
 
   const reportStatusSchema = z.object({ status: z.enum(["OPEN", "RESOLVED", "DISMISSED"]) });
