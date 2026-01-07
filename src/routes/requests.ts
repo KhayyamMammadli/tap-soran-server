@@ -9,6 +9,36 @@ const upload = multer({ dest: process.env.UPLOAD_DIR || "uploads" });
 export function requestsRouter(prisma: PrismaClient) {
   const r = Router();
 
+  // Buyer: list own requests (for Buyer panel)
+  // Includes accepted conversation so buyer can jump straight into chat.
+  r.get("/mine", async (req, res) => {
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+    if (req.user.role !== "BUYER") return res.status(403).json({ error: "Only buyers" });
+
+    const takeRaw = Array.isArray(req.query.take) ? req.query.take[0] : (req.query.take as string | undefined);
+    const skipRaw = Array.isArray(req.query.skip) ? req.query.skip[0] : (req.query.skip as string | undefined);
+    const take = Math.min(Math.max(Number(takeRaw || "20") || 20, 1), 100);
+    const skip = Math.max(Number(skipRaw || "0") || 0, 0);
+
+    const requests = await prisma.request.findMany({
+      where: { buyerId: req.user.id },
+      include: {
+        category: true,
+        accepted: {
+          include: {
+            seller: { select: { id: true, fullName: true, avatarUrl: true } },
+            conversation: { select: { id: true } },
+          },
+        },
+      },
+      orderBy: { createdAt: "desc" },
+      take,
+      skip,
+    });
+
+    res.json(requests);
+  });
+
   // Buyer creates request (title + category + scope + optional image)
   r.post("/", upload.single("image"), async (req, res) => {
     if (!req.user) return res.status(401).json({ error: "Unauthorized" });

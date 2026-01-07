@@ -227,7 +227,7 @@ export function adminRouter(prisma: PrismaClient) {
         blocked: false,
         blockedReason: null,
         blockedAt: null,
-        blockedById: req.user!.id,
+        blockedById: null,
       },
       select: {
         id: true,

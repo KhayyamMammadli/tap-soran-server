@@ -197,91 +197,6 @@ export function conversationsRouter(prisma: PrismaClient) {
         finalText = censorAzVulgar(finalText);
       }
 
-      // Vulgarity enforcement: on the 2nd vulgar attempt, auto-block the user and force logout.
-      // NOTE: We do not freeze the chat; we block the account.
-      if (vulgarDetected) {
-        const strike = (sender.moderationStrikes || 0) + 1;
-
-        // Create moderation event + escalate in a single transaction
-        const sys = await prisma.$transaction(async (tx) => {
-          await tx.moderationEvent.create({
-            data: {
-              userId: sender.id,
-              conversationId: id,
-              messageText: (vulgarOriginal || "").slice(0, 500),
-              reasonCode: "VULGAR",
-            },
-          });
-
-          if (strike >= 2) {
-            await tx.user.update({
-              where: { id: sender.id },
-              data: {
-                moderationStrikes: strike,
-                blocked: true,
-                blockedReason: "Vulqar ifadələrdən istifadə (təkrar)",
-                blockedAt: new Date(),
-                tokenVersion: { increment: 1 },
-              },
-            });
-          } else {
-            await tx.user.update({ where: { id: sender.id }, data: { moderationStrikes: strike } });
-          }
-
-          // Insert a SYSTEM warning into the conversation (visible to both participants)
-          return tx.message.create({
-            data: {
-              conversationId: id,
-              senderId: sender.id,
-              type: MessageType.SYSTEM,
-              text:
-                strike >= 2
-                  ? "⛔ Hesab bloklandı. Səbəb: Vulqar ifadələrdən təkrar istifadə."
-                  : "⚠️ Vulqar ifadə aşkarlandı. Təkrar etsəniz hesabınız blok olunacaq.",
-            },
-          });
-        });
-
-        // Emit the SYSTEM warning into the live chat
-        const ioLive = req.app.get("io");
-        try {
-          ioLive?.to?.(`user:${conv.userAId}`)?.to?.(`user:${conv.userBId}`)?.emit?.("new_message", sys);
-        } catch {}
-
-        // Notify super admins
-        const admins = await prisma.user.findMany({ where: { role: "SUPER_ADMIN" }, select: { id: true } });
-        const offendingPreview = clip(censorAzVulgar(vulgarOriginal || ""));
-        const adminNotifs: Array<{ adminId: string; notif: any }> = [];
-        for (const a of admins) {
-          const n = await prisma.notification.create({
-            data: {
-              userId: a.id,
-              title: "Vulqar söz aşkarlandı",
-              body: clip(`${sender.fullName}: ${offendingPreview}`),
-              type: "ADMIN_VULGAR",
-            },
-          });
-          adminNotifs.push({ adminId: a.id, notif: n });
-        }
-
-        // Socket updates (kick on block)
-        const io = req.app.get("io");
-        if (io) {
-          for (const a of adminNotifs) io.to(`user:${a.adminId}`).emit("new_notification", a.notif);
-          const u = await prisma.user.findUnique({
-            where: { id: sender.id },
-            select: { blocked: true, blockedReason: true, blockedAt: true },
-          });
-          if (u?.blocked) {
-            io.to(`user:${sender.id}`).emit("userBlocked", { reason: u.blockedReason, blockedAt: u.blockedAt?.toISOString() });
-            io.in(`user:${sender.id}`).disconnectSockets(true);
-          }
-        }
-
-        // Do not store or deliver the vulgar message content itself
-        return res.status(422).json({ error: "MessageBlocked", reasonCode: "VULGAR", reason: "Vulqar ifadə" });
-      }
-
       // Safety moderation: block illegal trade/contact/link content (server-side)
       if (finalText) {
         const safety = checkChatSafety(finalText);
@@ -398,7 +313,38 @@ export function conversationsRouter(prisma: PrismaClient) {
         },
       });
 
-      // vulgarDetected is handled earlier (message is blocked and/or user is blocked).
+      // If we detected vulgarity, create a SYSTEM warning message in the chat
+      // and notify SUPER_ADMIN users.
+      let systemMsg: any = null;
+      const adminNotifs: Array<{ adminId: string; notif: any }> = [];
+      if (vulgarDetected) {
+        systemMsg = await prisma.message.create({
+          data: {
+            conversationId: id,
+            senderId: req.user.id,
+            type: MessageType.SYSTEM,
+            text: "⚠️ Vulqar ifadə aşkarlandı. Davam etsəniz hesabınız blok olunacaq.",
+          },
+        });
+
+        const admins = await prisma.user.findMany({
+          where: { role: "SUPER_ADMIN" },
+          select: { id: true },
+        });
+
+        const offendingPreview = clip(censorAzVulgar(vulgarOriginal || ""));
+        for (const a of admins) {
+          const n = await prisma.notification.create({
+            data: {
+              userId: a.id,
+              title: "Vulqar söz aşkarlandı",
+              body: clip(`${req.user.fullName}: ${offendingPreview}`),
+              type: "ADMIN_VULGAR",
+            },
+          });
+          adminNotifs.push({ adminId: a.id, notif: n });
+        }
+      }
 
       // Determine receiver
       const receiverId = conv.userAId === req.user.id ? conv.userBId : conv.userAId;
@@ -465,7 +411,14 @@ export function conversationsRouter(prisma: PrismaClient) {
       const io = req.app.get("io");
       if (io) {
         io.to(`user:${conv.userAId}`).to(`user:${conv.userBId}`).emit("new_message", msg);
+        if (systemMsg) {
+          io.to(`user:${conv.userAId}`).to(`user:${conv.userBId}`).emit("new_message", systemMsg);
+        }
         io.to(`user:${receiverId}`).emit("new_notification", notif);
+
+        for (const a of adminNotifs) {
+          io.to(`user:${a.adminId}`).emit("new_notification", a.notif);
+        }
       }
 
       res.json(msg);
