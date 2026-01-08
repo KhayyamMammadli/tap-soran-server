@@ -5,6 +5,34 @@ import { z } from "zod";
 export function adminRouter(prisma: PrismaClient) {
   const r = Router();
 
+  async function deleteRequestCascade(requestId: string) {
+    await prisma.$transaction(async (tx) => {
+      const reqRow = await tx.request.findUnique({
+        where: { id: requestId },
+        select: { id: true, accepted: { select: { id: true } } },
+      });
+      if (!reqRow) return;
+
+      if (reqRow.accepted?.id) {
+        const conv = await tx.conversation.findFirst({
+          where: { acceptedRequestId: reqRow.accepted.id },
+          select: { id: true },
+        });
+
+        if (conv?.id) {
+          // Must delete reports first (FKs to message + conversation)
+          await tx.messageReport.deleteMany({ where: { conversationId: conv.id } });
+          await tx.message.deleteMany({ where: { conversationId: conv.id } });
+          await tx.conversation.deleteMany({ where: { id: conv.id } });
+        }
+
+        await tx.acceptedRequest.deleteMany({ where: { id: reqRow.accepted.id } });
+      }
+
+      await tx.request.deleteMany({ where: { id: requestId } });
+    });
+  }
+
   // Legal pages (Privacy Policy / Terms) editable from admin.
   const legalType = z.enum(["PRIVACY", "TERMS"]);
   r.get("/legal/:type", async (req, res) => {
@@ -79,6 +107,34 @@ export function adminRouter(prisma: PrismaClient) {
     // Backward-compatible shape for older admin UI: expose `reportedUser` too.
     const normalized = rows.map((r: any) => ({ ...r, reportedUser: r.reportedUser ?? r.targetUser }));
     return res.json(normalized);
+  });
+
+  // Complaints (general user complaints, not tied to chat)
+  r.get("/complaints", async (req, res) => {
+    const status = String(req.query.status || "OPEN").toUpperCase();
+    const rows = await prisma.userComplaint.findMany({
+      where: status === "ALL" ? {} : { status: status as any },
+      orderBy: { createdAt: "desc" },
+      include: {
+        reporter: { select: { id: true, fullName: true, email: true } },
+        targetUser: { select: { id: true, fullName: true, email: true, reportCount: true, blocked: true } },
+        request: { select: { id: true, title: true } },
+      },
+      take: 500,
+    });
+    return res.json(rows);
+  });
+
+  const complaintStatusSchema = z.object({ status: z.enum(["OPEN", "RESOLVED", "DISMISSED"]) });
+  r.patch("/complaints/:id/status", async (req, res) => {
+    const parsed = complaintStatusSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+    try {
+      const updated = await prisma.userComplaint.update({ where: { id: req.params.id }, data: { status: parsed.data.status as any } });
+      return res.json(updated);
+    } catch (e: any) {
+      return res.status(400).json({ error: e?.message || "Update failed" });
+    }
   });
 
   const reportStatusSchema = z.object({ status: z.enum(["OPEN", "RESOLVED", "DISMISSED"]) });
@@ -388,6 +444,29 @@ export function adminRouter(prisma: PrismaClient) {
       },
     });
     return res.json(rows);
+  });
+
+  // Delete a single request (cascade)
+  r.delete("/requests/:id", async (req, res) => {
+    try {
+      await deleteRequestCascade(req.params.id);
+      return res.json({ ok: true });
+    } catch (e: any) {
+      return res.status(400).json({ error: e?.message || "Request delete failed" });
+    }
+  });
+
+  // Delete all requests (cascade)
+  r.delete("/requests", async (_req, res) => {
+    try {
+      const ids = await prisma.request.findMany({ select: { id: true } });
+      for (const row of ids) {
+        await deleteRequestCascade(row.id);
+      }
+      return res.json({ ok: true, deleted: ids.length });
+    } catch (e: any) {
+      return res.status(400).json({ error: e?.message || "Bulk delete failed" });
+    }
   });
 
   // Conversations list (all)

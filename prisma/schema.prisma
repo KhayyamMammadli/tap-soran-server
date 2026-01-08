@@ -82,6 +82,10 @@ model User {
   reportsReceived    MessageReport[] @relation("ReportTarget")
   moderationEvents   ModerationEvent[]
 
+  // General (non-chat) user complaints
+  complaintsMade     UserComplaint[] @relation("ComplaintBy")
+  complaintsReceived UserComplaint[] @relation("ComplaintTarget")
+
   blocked       Boolean   @default(false)
   blockedReason String?
   blockedAt     DateTime?
@@ -94,6 +98,29 @@ model User {
   reportCount       Int      @default(0)
 
   createdAt DateTime @default(now())
+}
+
+model UserComplaint {
+  id           String       @id @default(cuid())
+
+  reporterId   String
+  reporter     User         @relation("ComplaintBy", fields: [reporterId], references: [id])
+
+  targetUserId String
+  targetUser   User         @relation("ComplaintTarget", fields: [targetUserId], references: [id])
+
+  /// Optional context: complaint about a specific request.
+  requestId    String?
+  request      Request?     @relation("ComplaintRequest", fields: [requestId], references: [id])
+
+  reason       String
+  details      String?
+  status       ReportStatus @default(OPEN)
+  createdAt    DateTime     @default(now())
+
+  @@index([targetUserId])
+  @@index([status])
+  @@index([createdAt])
 }
 
 enum ReportStatus {
@@ -164,6 +191,9 @@ model Request {
 
   buyerId    String
   buyer      User         @relation("BuyerRequests", fields: [buyerId], references: [id])
+
+  /// Complaints that reference this request (optional).
+  complaints UserComplaint[] @relation("ComplaintRequest")
 
   accepted   AcceptedRequest?
   createdAt  DateTime     @default(now())
