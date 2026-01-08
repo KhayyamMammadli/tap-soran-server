@@ -1,6 +1,6 @@
 import "dotenv/config";
 import express from "express";
-import cors from "cors";
+import cors, { type CorsOptions } from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import compression from "compression";
@@ -34,7 +34,7 @@ function parseCorsOrigins(): string[] | null {
     .filter(Boolean);
 }
 
-function corsOptions() {
+function corsOptions(): CorsOptions {
   const allowed = parseCorsOrigins();
   // In local development, browsers hit the API from localhost / 127.0.0.1 ports (Vite/Next/etc.)
   // even if CORS_ORIGINS is set for mobile LAN testing. Allow localhost dev origins safely.
@@ -62,7 +62,7 @@ function corsOptions() {
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
     optionsSuccessStatus: 204,
-  } as const;
+  };
 }
 
 async function ensureSuperAdmin() {
