@@ -89,6 +89,8 @@ model User {
   blocked       Boolean   @default(false)
   blockedReason String?
   blockedAt     DateTime?
+  /// If set, the account is blocked until this timestamp. If null, block is indefinite.
+  blockedUntil  DateTime?
   blockedById   String?
 
   // Security / moderation

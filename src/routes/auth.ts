@@ -141,11 +141,31 @@ r.post("/login", async (req, res) => {
         blocked: true,
         blockedReason: true,
         blockedAt: true,
+        blockedUntil: true,
         category: { select: { id: true } },
       },
     });
     if (!user) return res.status(401).json({ error: "Invalid credentials" });
-    if ((user as any).blocked) return res.status(403).json({ error: "Blocked", reason: (user as any).blockedReason, blockedAt: (user as any).blockedAt });
+
+    // Block enforcement: if blockedUntil is in the past, auto-unblock (best-effort).
+    if ((user as any).blocked) {
+      const until = (user as any).blockedUntil ? new Date((user as any).blockedUntil) : null;
+      if (until && until.getTime() <= Date.now()) {
+        try {
+          await prisma.user.update({
+            where: { id: user.id },
+            data: { blocked: false, blockedReason: null, blockedAt: null, blockedUntil: null, blockedById: null },
+          });
+        } catch {}
+      } else {
+        return res.status(403).json({
+          error: "Blocked",
+          reason: (user as any).blockedReason,
+          blockedAt: (user as any).blockedAt,
+          blockedUntil: (user as any).blockedUntil,
+        });
+      }
+    }
 
 // Role enforcement: buyer/seller cannot login as the other role.
 // Super admin is allowed regardless (admin panel has separate login).

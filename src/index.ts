@@ -208,13 +208,29 @@ io.use(async (socket, next) => {
         role: true,
         tokenVersion: true,
         blocked: true,
+        blockedAt: true,
+        blockedUntil: true,
         category: { select: { id: true } },
       },
     });
     if (!user) return next(new Error("User not found"));
     const tv = typeof (payload as any).tv === "number" ? (payload as any).tv : 0;
     if ((user as any).tokenVersion !== tv) return next(new Error("Unauthorized"));
-    if ((user as any).blocked) return next(new Error("Blocked"));
+    if ((user as any).blocked) {
+      const until = (user as any).blockedUntil ? new Date((user as any).blockedUntil) : null;
+      if (until && until.getTime() <= Date.now()) {
+        try {
+          await prisma.user.update({
+            where: { id: user.id },
+            data: { blocked: false, blockedReason: null, blockedAt: null, blockedUntil: null, blockedById: null },
+          });
+        } catch {}
+      } else {
+        const blockedAt = (user as any).blockedAt ? new Date((user as any).blockedAt) : null;
+        const grace = blockedAt ? Date.now() - blockedAt.getTime() < 60_000 : false;
+        if (!grace) return next(new Error("Blocked"));
+      }
+    }
 
     (socket as any).user = {
       id: user.id,

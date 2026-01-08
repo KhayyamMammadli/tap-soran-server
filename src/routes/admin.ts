@@ -1,6 +1,8 @@
 import { PrismaClient } from "@prisma/client";
 import { Router } from "express";
 import { z } from "zod";
+import { sendExpoPush } from "../utils/push";
+import { sendMail } from "../utils/mail";
 
 export function adminRouter(prisma: PrismaClient) {
   const r = Router();
@@ -81,6 +83,7 @@ export function adminRouter(prisma: PrismaClient) {
         blocked: true,
         blockedReason: true,
         blockedAt: true,
+        blockedUntil: true,
         reportCount: true,
         moderationStrikes: true,
         chatFrozenUntil: true,
@@ -214,6 +217,7 @@ export function adminRouter(prisma: PrismaClient) {
         blocked: true,
         blockedReason: true,
         blockedAt: true,
+        blockedUntil: true,
         blockedById: true,
         category: { select: { id: true, name: true } },
       },
@@ -230,12 +234,22 @@ export function adminRouter(prisma: PrismaClient) {
 
   const blockSchema = z.object({ reason: z.string().min(3) });
 
+  const blockWithUntilSchema = z.object({
+    reason: z.string().min(3).max(500),
+    blockedUntil: z.string().datetime().optional().or(z.literal("")),
+  });
+
+  // Block a user (optionally until a specific date/time).
+  // Note: we do NOT force-invalidate the token immediately. Instead, the app will log out ~1 minute later.
+  // The API enforces a 60s grace window (auth middleware) so the user can see the notice.
   r.patch("/users/:id/block", async (req, res) => {
-    const parsed = blockSchema.safeParse(req.body);
+    const parsed = blockWithUntilSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
 
     const targetId = req.params.id;
     if (targetId === req.user!.id) return res.status(400).json({ error: "You can't block yourself" });
+
+    const until = parsed.data.blockedUntil ? new Date(parsed.data.blockedUntil) : null;
 
     const user = await prisma.user.update({
       where: { id: targetId },
@@ -243,8 +257,8 @@ export function adminRouter(prisma: PrismaClient) {
         blocked: true,
         blockedReason: parsed.data.reason,
         blockedAt: new Date(),
+        blockedUntil: until,
         blockedById: req.user!.id,
-        tokenVersion: { increment: 1 },
       },
       select: {
         id: true,
@@ -254,30 +268,195 @@ export function adminRouter(prisma: PrismaClient) {
         blocked: true,
         blockedReason: true,
         blockedAt: true,
+        blockedUntil: true,
         blockedById: true,
       },
     });
 
-    await prisma.notification.create({
+    const blockedUntilText = until ? `\nBlok müddəti: ${until.toLocaleString()}` : "";
+    const notif = await prisma.notification.create({
       data: {
         userId: targetId,
         title: "Hesab bloklandı",
-        body: `Səbəb: ${parsed.data.reason}`,
-        type: "BLOCKED",
+        body: `Səbəb: ${parsed.data.reason}${blockedUntilText}`,
+        type: "ACCOUNT_BLOCKED",
+        data: {
+          reason: parsed.data.reason,
+          blockedAt: user.blockedAt?.toISOString?.() ?? new Date().toISOString(),
+          blockedUntil: until ? until.toISOString() : null,
+        },
       },
     });
 
-    // Kick the user out immediately (mobile/web)
+    // Push + socket notify (best-effort)
+    try {
+      const u = await prisma.user.findUnique({
+        where: { id: targetId },
+        select: {
+          expoPushToken: true,
+          pushEnabled: true,
+          pushSoundEnabled: true,
+          pushSound: true,
+          email: true,
+          fullName: true,
+        },
+      });
+      if (u?.pushEnabled) {
+        await sendExpoPush(
+          u.expoPushToken,
+          "Hesab bloklandı",
+          `Səbəb: ${parsed.data.reason}`,
+          {
+            type: "ACCOUNT_BLOCKED",
+            reason: parsed.data.reason,
+            blockedUntil: until ? until.toISOString() : null,
+          },
+          { sound: u.pushSoundEnabled ? (u.pushSound === "DEFAULT" ? undefined : String(u.pushSound).toLowerCase()) : null }
+        );
+      }
+
+      if (u?.email) {
+        await sendMail({
+          to: u.email,
+          subject: "Tap-Soran • Hesab bloklandı",
+          text: `Salam ${u.fullName || ""}!\n\nHesabınız admin tərəfindən bloklandı.\nSəbəb: ${parsed.data.reason}${blockedUntilText}\n\nƏgər bunun səhv olduğunu düşünürsünüzsə, dəstək ilə əlaqə saxlayın.`,
+        });
+      }
+    } catch {}
+
     try {
       const io = req.app.get("io");
+      io?.to?.(`user:${targetId}`)?.emit?.("accountBlocked", {
+        reason: parsed.data.reason,
+        blockedAt: user.blockedAt?.toISOString?.() ?? new Date().toISOString(),
+        blockedUntil: until ? until.toISOString() : null,
+        notificationId: notif.id,
+      });
+      // Backward compatibility for older clients
       io?.to?.(`user:${targetId}`)?.emit?.("userBlocked", {
         reason: parsed.data.reason,
-        blockedAt: new Date().toISOString(),
+        blockedAt: user.blockedAt?.toISOString?.() ?? new Date().toISOString(),
+        blockedUntil: until ? until.toISOString() : null,
       });
-      io?.in?.(`user:${targetId}`)?.disconnectSockets?.(true);
     } catch {}
 
     return res.json(user);
+  });
+
+  // Block the target user of a complaint with a note + until date.
+  r.post("/complaints/:id/block", async (req, res) => {
+    const parsed = blockWithUntilSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+    const complaint = await prisma.userComplaint.findUnique({
+      where: { id: req.params.id },
+      include: {
+        reporter: { select: { id: true, fullName: true, email: true } },
+        targetUser: { select: { id: true, fullName: true, email: true, blocked: true } },
+        request: { select: { id: true, title: true } },
+      },
+    });
+    if (!complaint) return res.status(404).json({ error: "Not found" });
+
+    const targetId = complaint.targetUserId;
+    if (targetId === req.user!.id) return res.status(400).json({ error: "You can't block yourself" });
+
+    const until = parsed.data.blockedUntil ? new Date(parsed.data.blockedUntil) : null;
+
+    const updated = await prisma.$transaction(async (tx) => {
+      const u = await tx.user.update({
+        where: { id: targetId },
+        data: {
+          blocked: true,
+          blockedReason: parsed.data.reason,
+          blockedAt: new Date(),
+          blockedUntil: until,
+          blockedById: req.user!.id,
+        },
+        select: {
+          id: true,
+          fullName: true,
+          email: true,
+          blocked: true,
+          blockedReason: true,
+          blockedAt: true,
+          blockedUntil: true,
+        },
+      });
+
+      await tx.userComplaint.update({ where: { id: complaint.id }, data: { status: "RESOLVED" as any } });
+
+      await tx.notification.create({
+        data: {
+          userId: targetId,
+          title: "Hesab bloklandı",
+          body: `Səbəb: ${parsed.data.reason}${until ? `\nBlok müddəti: ${until.toLocaleString()}` : ""}`,
+          type: "ACCOUNT_BLOCKED",
+          data: {
+            type: "ACCOUNT_BLOCKED",
+            reason: parsed.data.reason,
+            blockedUntil: until ? until.toISOString() : null,
+            complaintId: complaint.id,
+            requestId: complaint.requestId ?? null,
+          },
+        },
+      });
+
+      return u;
+    });
+
+    // Push/email/socket best-effort (reuse the logic by calling the /users/:id/block handler in code)
+    try {
+      const u = await prisma.user.findUnique({
+        where: { id: targetId },
+        select: {
+          expoPushToken: true,
+          pushEnabled: true,
+          pushSoundEnabled: true,
+          pushSound: true,
+          email: true,
+          fullName: true,
+        },
+      });
+      if (u?.pushEnabled) {
+        await sendExpoPush(
+          u.expoPushToken,
+          "Hesab bloklandı",
+          `Səbəb: ${parsed.data.reason}`,
+          {
+            type: "ACCOUNT_BLOCKED",
+            reason: parsed.data.reason,
+            blockedUntil: until ? until.toISOString() : null,
+            complaintId: complaint.id,
+          },
+          { sound: u.pushSoundEnabled ? (u.pushSound === "DEFAULT" ? undefined : String(u.pushSound).toLowerCase()) : null }
+        );
+      }
+      if (u?.email) {
+        await sendMail({
+          to: u.email,
+          subject: "Tap-Soran • Hesab bloklandı",
+          text: `Salam ${u.fullName || ""}!\n\nHesabınız admin tərəfindən bloklandı.\nSəbəb: ${parsed.data.reason}${until ? `\nBlok müddəti: ${until.toLocaleString()}` : ""}\n\nƏgər bunun səhv olduğunu düşünürsünüzsə, dəstək ilə əlaqə saxlayın.`,
+        });
+      }
+    } catch {}
+
+    try {
+      const io = req.app.get("io");
+      io?.to?.(`user:${targetId}`)?.emit?.("accountBlocked", {
+        reason: parsed.data.reason,
+        blockedAt: updated.blockedAt?.toISOString?.() ?? new Date().toISOString(),
+        blockedUntil: until ? until.toISOString() : null,
+        complaintId: complaint.id,
+      });
+      io?.to?.(`user:${targetId}`)?.emit?.("userBlocked", {
+        reason: parsed.data.reason,
+        blockedAt: updated.blockedAt?.toISOString?.() ?? new Date().toISOString(),
+        blockedUntil: until ? until.toISOString() : null,
+      });
+    } catch {}
+
+    return res.json({ ok: true, user: updated });
   });
 
   r.patch("/users/:id/unblock", async (req, res) => {
@@ -289,6 +468,7 @@ export function adminRouter(prisma: PrismaClient) {
         blocked: false,
         blockedReason: null,
         blockedAt: null,
+        blockedUntil: null,
         blockedById: null,
       },
       select: {
@@ -299,6 +479,7 @@ export function adminRouter(prisma: PrismaClient) {
         blocked: true,
         blockedReason: true,
         blockedAt: true,
+        blockedUntil: true,
         blockedById: true,
       },
     });
