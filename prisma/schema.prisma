@@ -86,6 +86,10 @@ model User {
   complaintsMade     UserComplaint[] @relation("ComplaintBy")
   complaintsReceived UserComplaint[] @relation("ComplaintTarget")
 
+  // Reviews (buyer -> seller)
+  reviewsMade        SellerReview[] @relation("ReviewsByBuyer")
+  reviewsReceived    SellerReview[] @relation("ReviewsForSeller")
+
   blocked       Boolean   @default(false)
   blockedReason String?
   blockedAt     DateTime?
@@ -100,6 +104,28 @@ model User {
   reportCount       Int      @default(0)
 
   createdAt DateTime @default(now())
+}
+
+model SellerReview {
+  id        String   @id @default(cuid())
+
+  requestId String   @unique
+  request   Request  @relation(fields: [requestId], references: [id])
+
+  buyerId   String
+  buyer     User     @relation("ReviewsByBuyer", fields: [buyerId], references: [id])
+
+  sellerId  String
+  seller    User     @relation("ReviewsForSeller", fields: [sellerId], references: [id])
+
+  rating    Int
+  comment   String?
+
+  createdAt DateTime @default(now())
+
+  @@index([sellerId])
+  @@index([buyerId])
+  @@index([createdAt])
 }
 
 model UserComplaint {
@@ -198,6 +224,8 @@ model Request {
   complaints UserComplaint[] @relation("ComplaintRequest")
 
   accepted   AcceptedRequest?
+  completedAt DateTime?
+  review      SellerReview?
   createdAt  DateTime     @default(now())
 }
 

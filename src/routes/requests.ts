@@ -24,6 +24,7 @@ export function requestsRouter(prisma: PrismaClient) {
       where: { buyerId: req.user.id },
       include: {
         category: true,
+        review: true,
         accepted: {
           include: {
             seller: { select: { id: true, fullName: true, avatarUrl: true, phone: true, whatsapp: true } },
@@ -128,7 +129,7 @@ export function requestsRouter(prisma: PrismaClient) {
           { scope: "CATEGORY_SELLERS", categoryId: req.user.categoryId || "__none__" },
         ],
       },
-      include: { category: true, buyer: { select: { id: true, fullName: true, avatarUrl: true } }, accepted: true },
+      include: { category: true, buyer: { select: { id: true, fullName: true, avatarUrl: true } }, accepted: true, review: true },
       orderBy: { createdAt: "desc" },
       take,
       skip,
@@ -231,6 +232,108 @@ export function requestsRouter(prisma: PrismaClient) {
     res.json(accepted);
   });
 
+  // Buyer completes a request and leaves a review for the seller
+  r.post("/:id/complete", async (req, res) => {
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+    if (req.user.role !== "BUYER") return res.status(403).json({ error: "Only buyers" });
+
+    const requestId = req.params.id;
+
+    const schema = z.object({
+      rating: z.coerce.number().int().min(1).max(5),
+      comment: z.string().trim().max(500).optional().or(z.literal("")),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+    const row = await prisma.request.findUnique({
+      where: { id: requestId },
+      include: { accepted: true, review: true, buyer: { select: { id: true, fullName: true } } },
+    });
+    if (!row) return res.status(404).json({ error: "Not found" });
+    if (row.buyerId !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+    if (!row.accepted) return res.status(409).json({ error: "Sorğu hələ qəbul edilməyib" });
+    if (row.completedAt || row.review) return res.status(409).json({ error: "Sorğu artıq tamamlanıb" });
+
+    const sellerId = row.accepted.sellerId;
+    const rating = parsed.data.rating;
+    const comment = (parsed.data.comment || "").trim() || null;
+
+    const result = await prisma.$transaction(async (tx) => {
+      const updatedReq = await tx.request.update({
+        where: { id: requestId },
+        data: { completedAt: new Date() },
+      });
+      const review = await tx.sellerReview.create({
+        data: {
+          requestId,
+          buyerId: req.user!.id,
+          sellerId,
+          rating,
+          comment,
+        },
+      });
+      return { updatedReq, review };
+    });
+
+    // Notify seller (in-app) + push
+    const notif = await prisma.notification.create({
+      data: {
+        userId: sellerId,
+        title: "Sorğu tamamlandı",
+        body: `${row.buyer?.fullName || "Alıcı"} sorğunu tamamladı və sizə ${rating}/5 qiymət verdi`,
+        type: "REQUEST_COMPLETED",
+        data: { requestId, rating },
+      },
+    });
+
+    try {
+      const seller = await prisma.user.findUnique({
+        where: { id: sellerId },
+        select: { expoPushToken: true, pushEnabled: true, pushSoundEnabled: true, pushSound: true },
+      });
+      const pushEnabled = seller?.pushEnabled !== false && !!seller?.expoPushToken;
+      if (pushEnabled) {
+        const channelId =
+          !seller!.pushSoundEnabled
+            ? "silent"
+            : seller!.pushSound === "CHIME"
+              ? "sound_chime"
+              : seller!.pushSound === "DING"
+                ? "sound_ding"
+                : seller!.pushSound === "POP"
+                  ? "sound_pop"
+                  : "default";
+        const sound =
+          !seller!.pushSoundEnabled
+            ? null
+            : seller!.pushSound === "CHIME"
+              ? "chime.wav"
+              : seller!.pushSound === "DING"
+                ? "ding.wav"
+                : seller!.pushSound === "POP"
+                  ? "pop.wav"
+                  : "default";
+        await sendExpoPush(
+          seller!.expoPushToken,
+          notif.title,
+          notif.body,
+          { type: "REQUEST_COMPLETED", requestId, rating },
+          { sound, channelId }
+        );
+      }
+    } catch {}
+
+    const io = req.app.get("io");
+    if (io) {
+      io.to(`user:${sellerId}`).emit("new_notification", notif);
+      io.to(`user:${sellerId}`).emit("request_completed", { requestId, rating });
+      io.to(`user:${row.buyerId}`).emit("request_completed", { requestId, rating });
+    }
+
+    return res.json({ ok: true, request: result.updatedReq, review: result.review });
+  });
+
   // Buyer/Seller: request detail (for notification deep-link)
   // IMPORTANT: keep this route LAST to avoid collisions with "/feed".
   r.get("/:id", async (req, res) => {
@@ -241,6 +344,7 @@ export function requestsRouter(prisma: PrismaClient) {
       where: { id },
       include: {
         category: true,
+        review: true,
         buyer: { select: { id: true, fullName: true, avatarUrl: true } },
         accepted: {
           include: {

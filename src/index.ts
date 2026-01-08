@@ -23,6 +23,7 @@ import { requireSuperAdmin } from "./middleware/requireSuperAdmin";
 import { authMiddleware } from "./middleware/auth";
 import { verifyToken } from "./utils/jwt";
 import bcrypt from "bcryptjs";
+import { startRequestRetentionJob } from "./jobs/requestRetention";
 
 const prisma = new PrismaClient();
 
@@ -266,6 +267,10 @@ async function main() {
   } catch (e) {
     console.error("Super admin seed error:", e);
   }
+
+  // Keep requests for 28 days (auto-clean older ones)
+  startRequestRetentionJob(prisma);
+
   server.listen(PORT, () => console.log(`API running on http://localhost:${PORT}`));
 }
 
