@@ -1,8 +1,9 @@
-import { MessageType, PrismaClient, RequestScope } from "@prisma/client";
+import { PrismaClient, RequestScope } from "@prisma/client";
 import { Router } from "express";
 import { z } from "zod";
 import multer from "multer";
 import { sendExpoPush } from "../utils/push";
+import { notifyAdmins } from "../utils/adminNotify";
 
 const upload = multer({ dest: process.env.UPLOAD_DIR || "uploads" });
 
@@ -10,7 +11,6 @@ export function requestsRouter(prisma: PrismaClient) {
   const r = Router();
 
   // Buyer: list own requests (for Buyer panel)
-  // Includes accepted conversation so buyer can jump straight into chat.
   r.get("/mine", async (req, res) => {
     if (!req.user) return res.status(401).json({ error: "Unauthorized" });
     if (req.user.role !== "BUYER") return res.status(403).json({ error: "Only buyers" });
@@ -26,8 +26,7 @@ export function requestsRouter(prisma: PrismaClient) {
         category: true,
         accepted: {
           include: {
-            seller: { select: { id: true, fullName: true, avatarUrl: true } },
-            conversation: { select: { id: true } },
+            seller: { select: { id: true, fullName: true, avatarUrl: true, phone: true, whatsapp: true } },
           },
         },
       },
@@ -39,14 +38,19 @@ export function requestsRouter(prisma: PrismaClient) {
     res.json(requests);
   });
 
-  // Buyer creates request (title + category + scope + optional image)
+  // NOTE: `/:id` route is defined at the END of this file.
+  // Otherwise Express would treat "/feed" as an id ("feed") and break seller feeds.
+
+  // Buyer creates request (title + scope + optional category + optional image)
   r.post("/", upload.single("image"), async (req, res) => {
     if (!req.user) return res.status(401).json({ error: "Unauthorized" });
     if (req.user.role !== "BUYER") return res.status(403).json({ error: "Only buyers can create requests" });
 
     const schema = z.object({
       title: z.string().min(2),
-      categoryId: z.string(),
+      // When scope=CATEGORY_SELLERS, categoryId is required.
+      // When scope=ALL_SELLERS, categoryId is optional.
+      categoryId: z.string().optional(),
       scope: z.enum(["ALL_SELLERS", "CATEGORY_SELLERS"]),
     });
 
@@ -55,16 +59,42 @@ export function requestsRouter(prisma: PrismaClient) {
 
     const imageUrl = (req as any).file ? `/uploads/${(req as any).file.filename}` : null;
 
+    // Validate category rules
+    const scope = parsed.data.scope as RequestScope;
+    let categoryId: string | null = parsed.data.categoryId ?? null;
+    if (scope === "CATEGORY_SELLERS") {
+      if (!categoryId) return res.status(400).json({ error: "Kateqoriya seçin" });
+      const existsCat = await prisma.category.findUnique({ where: { id: categoryId }, select: { id: true } });
+      if (!existsCat) return res.status(400).json({ error: "Kateqoriya tapılmadı" });
+    } else {
+      // scope=ALL_SELLERS: category is optional; if provided, validate but keep it optional
+      if (categoryId) {
+        const existsCat = await prisma.category.findUnique({ where: { id: categoryId }, select: { id: true } });
+        if (!existsCat) categoryId = null;
+      }
+    }
+
     const request = await prisma.request.create({
       data: {
         title: parsed.data.title,
-        categoryId: parsed.data.categoryId,
-        scope: parsed.data.scope as RequestScope,
+        categoryId,
+        scope,
         imageUrl,
         buyerId: req.user.id,
       },
       include: { category: true, buyer: { select: { id: true, fullName: true, avatarUrl: true } } },
     });
+
+    // Notify SUPER_ADMIN users (and Telegram) about new requests
+    try {
+      const ioA = req.app.get("io");
+      await notifyAdmins(prisma, ioA, {
+        title: "Yeni sorğu",
+        body: `${request.buyer?.fullName || "Buyer"}: ${request.title} • ${request.scope}${request.category?.name ? ` • ${request.category.name}` : ""}`,
+        type: "ADMIN_NEW_REQUEST",
+        telegramText: `📝 Yeni sorğu\nBuyer: ${request.buyer?.fullName || "-"}\nTitle: ${request.title}\nScope: ${request.scope}${request.category?.name ? `\nCategory: ${request.category.name}` : ""}`,
+      });
+    } catch {}
 
     // socket notification
     const io = req.app.get("io");
@@ -72,7 +102,8 @@ export function requestsRouter(prisma: PrismaClient) {
       if (request.scope === "ALL_SELLERS") {
         io.to("sellers:all").emit("new_request", request);
       } else {
-        io.to(`sellers:cat:${request.categoryId}`).emit("new_request", request);
+        // CATEGORY_SELLERS must have categoryId
+        if (request.categoryId) io.to(`sellers:cat:${request.categoryId}`).emit("new_request", request);
       }
     }
 
@@ -106,12 +137,16 @@ export function requestsRouter(prisma: PrismaClient) {
     res.json(requests);
   });
 
-  // Seller accepts request -> creates conversation
-  r.post("/:id/accept", async (req, res) => {
+  // Seller accepts request (note/description + optional image)
+  r.post("/:id/accept", upload.single("image"), async (req, res) => {
     if (!req.user) return res.status(401).json({ error: "Unauthorized" });
     if (req.user.role !== "SELLER") return res.status(403).json({ error: "Only sellers can accept" });
 
     const requestId = req.params.id;
+
+    const schema = z.object({ note: z.string().trim().min(2).max(500) });
+    const parsedBody = schema.safeParse(req.body);
+    if (!parsedBody.success) return res.status(400).json({ error: parsedBody.error.flatten() });
 
     const reqRow = await prisma.request.findUnique({
       where: { id: requestId },
@@ -120,38 +155,20 @@ export function requestsRouter(prisma: PrismaClient) {
     if (!reqRow) return res.status(404).json({ error: "Not found" });
     if (reqRow.accepted) return res.status(409).json({ error: "Already accepted" });
 
+    // Enforce request visibility rules for acceptance
+    if (reqRow.scope === "CATEGORY_SELLERS" && reqRow.categoryId !== (req.user.categoryId || "__none__")) {
+      return res.status(403).json({ error: "Bu sorğu sizin kateqoriyanıza aid deyil" });
+    }
+
     const accepted = await prisma.acceptedRequest.create({
       data: {
         requestId,
         sellerId: req.user.id,
-        conversation: {
-          create: {
-            userAId: reqRow.buyerId,
-            userBId: req.user.id,
-          },
-        },
+        sellerNote: parsedBody.data.note,
+        sellerImageUrl: (req as any).file ? `/uploads/${(req as any).file.filename}` : null,
       },
-      include: { conversation: true, request: true },
+      include: { request: true, seller: { select: { id: true, fullName: true, avatarUrl: true, phone: true, whatsapp: true } } },
     });
-
-    // Add a SYSTEM message to make the chat context obvious
-    if (accepted.conversation) {
-      const systemText = `Sorğu: ${reqRow.title}`;
-      const sys = await prisma.message.create({
-        data: {
-          conversationId: accepted.conversation.id,
-          senderId: req.user.id,
-          type: MessageType.SYSTEM,
-          text: systemText,
-          mediaUrl: reqRow.imageUrl ?? null,
-        },
-      });
-
-      const io = req.app.get("io");
-      if (io) {
-        io.to(`user:${reqRow.buyerId}`).to(`user:${req.user.id}`).emit("new_message", sys);
-      }
-    }
 
     // Create notification for buyer (in-app) + push
     const notif = await prisma.notification.create({
@@ -160,6 +177,7 @@ export function requestsRouter(prisma: PrismaClient) {
         title: "Sorğunuz qəbul edildi",
         body: `${req.user.fullName} sorğunuzu qəbul etdi: ${reqRow.title}`,
         type: "REQUEST_ACCEPTED",
+        data: { requestId, acceptedRequestId: accepted.id },
       },
     });
 
@@ -197,7 +215,7 @@ export function requestsRouter(prisma: PrismaClient) {
         {
           type: "REQUEST_ACCEPTED",
           requestId,
-          conversationId: accepted.conversation?.id,
+          acceptedRequestId: accepted.id,
         },
         { sound, channelId }
       );
@@ -211,6 +229,37 @@ export function requestsRouter(prisma: PrismaClient) {
     }
 
     res.json(accepted);
+  });
+
+  // Buyer/Seller: request detail (for notification deep-link)
+  // IMPORTANT: keep this route LAST to avoid collisions with "/feed".
+  r.get("/:id", async (req, res) => {
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+    const id = req.params.id;
+
+    const row = await prisma.request.findUnique({
+      where: { id },
+      include: {
+        category: true,
+        buyer: { select: { id: true, fullName: true, avatarUrl: true } },
+        accepted: {
+          include: {
+            seller: { select: { id: true, fullName: true, avatarUrl: true, phone: true, whatsapp: true } },
+          },
+        },
+      },
+    });
+    if (!row) return res.status(404).json({ error: "Not found" });
+
+    // Buyer can only view own requests. Seller can view requests from feed rules.
+    if (req.user.role === "BUYER" && row.buyerId !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+    if (req.user.role === "SELLER") {
+      const allowed =
+        row.scope === "ALL_SELLERS" || (row.scope === "CATEGORY_SELLERS" && row.categoryId === (req.user.categoryId || "__none__"));
+      if (!allowed) return res.status(403).json({ error: "Forbidden" });
+    }
+
+    return res.json(row);
   });
 
   return r;

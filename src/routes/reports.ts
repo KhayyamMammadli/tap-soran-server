@@ -1,6 +1,7 @@
 import { PrismaClient } from "@prisma/client";
 import { Router } from "express";
 import { z } from "zod";
+import { notifyAdmins } from "../utils/adminNotify";
 
 export function reportsRouter(prisma: PrismaClient) {
   const r = Router();
@@ -100,23 +101,82 @@ export function reportsRouter(prisma: PrismaClient) {
         }
       }
 
-      // Notify admins
-      const admins = await prisma.user.findMany({ where: { role: "SUPER_ADMIN" }, select: { id: true } });
-      const adminNotifs: Array<{ adminId: string; notif: any }> = [];
-      for (const a of admins) {
-        const n = await prisma.notification.create({
+      // Notify admins (and Telegram)
+      await notifyAdmins(prisma, io, {
+        title: "Yeni şikayət",
+        body: `${user.fullName} → ${(target?.fullName ?? "istifadəçi")}: ${reason}`,
+        type: "ADMIN_REPORT",
+        telegramText: `🚨 Yeni şikayət\nReporter: ${user.fullName} (${user.email || "-"})\nTarget: ${(target?.fullName ?? "-") }\nReason: ${reason}`,
+      });
+
+      return res.json({ ok: true, report });
+    } catch (e: any) {
+      if (String(e?.message || "").includes("Unique constraint")) {
+        return res.status(409).json({ error: "Already reported" });
+      }
+      return res.status(400).json({ error: e?.message || "Report failed" });
+    }
+  });
+
+  // Create a report for a conversation (no need to pick a message on client).
+  // Server finds a recent message from the other participant that the reporter hasn't reported yet.
+  const convSchema = z.object({ reason: z.string().min(3).max(200) });
+  r.post("/conversation/:id", async (req, res) => {
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+    const user = req.user;
+
+    const parsed = convSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+    const convId = req.params.id;
+    const conv = await prisma.conversation.findUnique({ where: { id: convId }, select: { id: true, userAId: true, userBId: true } });
+    if (!conv) return res.status(404).json({ error: "Not found" });
+    if (conv.userAId !== user.id && conv.userBId !== user.id) return res.status(403).json({ error: "Forbidden" });
+
+    const targetUserId = conv.userAId === user.id ? conv.userBId : conv.userAId;
+
+    // Find a recent message from target that user hasn't reported yet.
+    const recent = await prisma.message.findMany({
+      where: { conversationId: convId, senderId: targetUserId },
+      orderBy: { createdAt: "desc" },
+      take: 30,
+      select: { id: true, senderId: true },
+    });
+    if (!recent.length) return res.status(400).json({ error: "No message to report" });
+
+    const recentIds = recent.map((m) => m.id);
+    const already = await prisma.messageReport.findMany({
+      where: { reporterId: user.id, messageId: { in: recentIds } },
+      select: { messageId: true },
+    });
+    const alreadySet = new Set(already.map((x) => x.messageId));
+    const pick = recent.find((m) => !alreadySet.has(m.id));
+    if (!pick) return res.status(409).json({ error: "Already reported" });
+
+    try {
+      const report = await prisma.$transaction(async (tx) => {
+        const created = await tx.messageReport.create({
           data: {
-            userId: a.id,
-            title: "Yeni şikayət",
-            body: `${user.fullName} → ${(target?.fullName ?? "istifadəçi")}: ${reason}`.slice(0, 200),
-            type: "ADMIN_REPORT",
+            conversationId: convId,
+            messageId: pick.id,
+            reporterId: user.id,
+            targetUserId,
+            reason: parsed.data.reason,
           },
         });
-        adminNotifs.push({ adminId: a.id, notif: n });
-      }
-      if (io) {
-        for (const a of adminNotifs) io.to(`user:${a.adminId}`).emit("new_notification", a.notif);
-      }
+        await tx.user.update({ where: { id: targetUserId }, data: { reportCount: { increment: 1 } } });
+        return created;
+      });
+
+      const target = await prisma.user.findUnique({ where: { id: targetUserId }, select: { id: true, fullName: true, email: true, reportCount: true } });
+
+      const io = req.app.get("io");
+      await notifyAdmins(prisma, io, {
+        title: "Yeni şikayət",
+        body: `${user.fullName} → ${(target?.fullName ?? "istifadəçi")}: ${parsed.data.reason}`,
+        type: "ADMIN_REPORT",
+        telegramText: `🚨 Yeni şikayət\nReporter: ${user.fullName} (${user.email || "-"})\nTarget: ${(target?.fullName ?? "-")}\nReason: ${parsed.data.reason}`,
+      });
 
       return res.json({ ok: true, report });
     } catch (e: any) {

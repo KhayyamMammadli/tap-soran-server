@@ -42,14 +42,28 @@ export function meRouter(prisma: PrismaClient) {
         fullName: true,
         email: true,
         tip: true,
-        categoryId: true,
         avatarUrl: true,
         blocked: true,
         blockedReason: true,
         blockedAt: true,
+        category: { select: { id: true } },
       },
     });
-    return res.json(user);
+
+    if (!user) return res.status(404).json({ error: "Not found" });
+
+    return res.json({
+      id: user.id,
+      role: user.role,
+      fullName: user.fullName,
+      email: user.email,
+      tip: user.tip,
+      categoryId: user.category?.id ?? null,
+      avatarUrl: user.avatarUrl ?? null,
+      blocked: user.blocked,
+      blockedReason: user.blockedReason,
+      blockedAt: user.blockedAt,
+    });
   });
 
   // Upload / update avatar

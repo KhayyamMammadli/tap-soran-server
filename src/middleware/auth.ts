@@ -10,7 +10,21 @@ export function authMiddleware(prisma: PrismaClient, opts?: { allowBlocked?: boo
 
       const token = header.slice(7);
       const payload = verifyToken(token);
-      const user = await prisma.user.findUnique({ where: { id: payload.userId } });
+      const user = await prisma.user.findUnique({
+        where: { id: payload.userId },
+        select: {
+          id: true,
+          role: true,
+          fullName: true,
+          email: true,
+          tip: true,
+          tokenVersion: true,
+          blocked: true,
+          blockedReason: true,
+          blockedAt: true,
+          category: { select: { id: true } },
+        },
+      });
       if (!user) return res.status(401).json({ error: "Unauthorized" });
 
       // Force-logout support: if tokenVersion changed, the token is invalid.
@@ -29,7 +43,7 @@ export function authMiddleware(prisma: PrismaClient, opts?: { allowBlocked?: boo
         fullName: user.fullName,
         email: user.email,
         tip: user.tip,
-        categoryId: user.categoryId,
+        categoryId: user.category?.id ?? null,
       };
 
       next();

@@ -15,12 +15,7 @@ export function adminRouter(prisma: PrismaClient) {
     return res.json(page);
   });
 
-  // NOTE: Admin UI might save content without touching the title (or send empty/whitespace).
-  // Keep it robust by accepting an optional title and falling back to an existing/default one.
-  const legalUpdateSchema = z.object({
-    title: z.string().trim().max(200).optional(),
-    content: z.string().min(10),
-  });
+  const legalUpdateSchema = z.object({ title: z.string().min(2).max(200), content: z.string().min(10) });
   r.put("/legal/:type", async (req, res) => {
     const parsedType = legalType.safeParse(String(req.params.type || "").toUpperCase());
     if (!parsedType.success) return res.status(400).json({ error: "Invalid type" });
@@ -28,23 +23,16 @@ export function adminRouter(prisma: PrismaClient) {
     const body = legalUpdateSchema.safeParse(req.body);
     if (!body.success) return res.status(400).json({ error: body.error.flatten() });
 
-    const existing = await prisma.legalPage.findUnique({ where: { type: parsedType.data as any } });
-    const incomingTitle = (body.data.title || "").trim();
-    const title =
-      incomingTitle.length >= 2
-        ? incomingTitle
-        : existing?.title || (parsedType.data === "TERMS" ? "İstifadəçi qaydaları" : "Məxfilik siyasəti");
-
     const updated = await prisma.legalPage.upsert({
       where: { type: parsedType.data as any },
       create: {
         type: parsedType.data as any,
-        title,
+        title: body.data.title,
         content: body.data.content,
         updatedById: req.user!.id,
       },
       update: {
-        title,
+        title: body.data.title,
         content: body.data.content,
         updatedById: req.user!.id,
       },
@@ -166,7 +154,6 @@ export function adminRouter(prisma: PrismaClient) {
         fullName: true,
         email: true,
         tip: true,
-        categoryId: true,
         createdAt: true,
         blocked: true,
         blockedReason: true,
@@ -175,7 +162,14 @@ export function adminRouter(prisma: PrismaClient) {
         category: { select: { id: true, name: true } },
       },
     });
-    return res.json(users);
+
+    // Keep backward-compatible shape for clients that expect `categoryId`.
+    return res.json(
+      users.map((u) => ({
+        ...u,
+        categoryId: u.category?.id ?? null,
+      }))
+    );
   });
 
   const blockSchema = z.object({ reason: z.string().min(3) });
@@ -302,18 +296,6 @@ export function adminRouter(prisma: PrismaClient) {
 
     try {
       await prisma.$transaction([
-        // Delete reports + moderation logs first to avoid FK violations.
-        prisma.messageReport.deleteMany({
-          where: {
-            OR: [
-              { reporterId: targetId },
-              { targetUserId: targetId },
-              ...(convIds.length ? [{ conversationId: { in: convIds } }] : []),
-            ],
-          },
-        }),
-        prisma.moderationEvent.deleteMany({ where: { userId: targetId } }),
-
         // Messages must be deleted before conversations
         ...(convIds.length
           ? [prisma.message.deleteMany({ where: { conversationId: { in: convIds } } })]

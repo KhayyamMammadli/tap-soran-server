@@ -7,6 +7,7 @@ import fs from "fs";
 import { clip, sendExpoPush } from "../utils/push";
 import { censorAzVulgar, hasAzVulgar } from "../utils/moderation";
 import { checkChatSafety, humanizeSafetyReason } from "../utils/safety";
+import { notifyAdmins } from "../utils/adminNotify";
 
 function ensureDir(p: string) {
   if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
@@ -263,21 +264,14 @@ export function conversationsRouter(prisma: PrismaClient) {
             ioLive?.to?.(`user:${conv.userAId}`)?.to?.(`user:${conv.userBId}`)?.emit?.("new_message", sys);
           } catch {}
 
-          // Notify super admins
-          const admins = await prisma.user.findMany({ where: { role: "SUPER_ADMIN" }, select: { id: true } });
+          // Notify super admins + Telegram
           const offendingPreview = clip(finalText);
-          const adminNotifs: Array<{ adminId: string; notif: any }> = [];
-          for (const a of admins) {
-            const n = await prisma.notification.create({
-              data: {
-                userId: a.id,
-                title: "Chat təhlükəsizlik xəbərdarlığı",
-                body: clip(`${sender.fullName}: ${reasonLabel} • ${offendingPreview}`),
-                type: "ADMIN_SAFETY",
-              },
-            });
-            adminNotifs.push({ adminId: a.id, notif: n });
-          }
+          await notifyAdmins(prisma, ioLive, {
+            title: "Chat təhlükəsizlik xəbərdarlığı",
+            body: `${sender.fullName}: ${reasonLabel} • ${offendingPreview}`,
+            type: "ADMIN_SAFETY",
+            telegramText: `⚠️ Təhlükəsizlik riski\nUser: ${sender.fullName}\nReason: ${reasonLabel}\nText: ${offendingPreview}`,
+          });
 
           // Socket updates (kick on block, or inform freeze)
           const io = req.app.get("io");
@@ -286,7 +280,7 @@ export function conversationsRouter(prisma: PrismaClient) {
             try {
               io.to(`user:${conv.userAId}`).to(`user:${conv.userBId}`).emit("new_message", sys);
             } catch {}
-            for (const a of adminNotifs) io.to(`user:${a.adminId}`).emit("new_notification", a.notif);
+            // notifyAdmins already emitted sockets
             // Re-read sender to know if blocked/frozen
             const u = await prisma.user.findUnique({ where: { id: sender.id }, select: { blocked: true, blockedReason: true, blockedAt: true, chatFrozenUntil: true } });
             if (u?.blocked) {
@@ -316,7 +310,6 @@ export function conversationsRouter(prisma: PrismaClient) {
       // If we detected vulgarity, create a SYSTEM warning message in the chat
       // and notify SUPER_ADMIN users.
       let systemMsg: any = null;
-      const adminNotifs: Array<{ adminId: string; notif: any }> = [];
       if (vulgarDetected) {
         systemMsg = await prisma.message.create({
           data: {
@@ -327,23 +320,13 @@ export function conversationsRouter(prisma: PrismaClient) {
           },
         });
 
-        const admins = await prisma.user.findMany({
-          where: { role: "SUPER_ADMIN" },
-          select: { id: true },
-        });
-
         const offendingPreview = clip(censorAzVulgar(vulgarOriginal || ""));
-        for (const a of admins) {
-          const n = await prisma.notification.create({
-            data: {
-              userId: a.id,
-              title: "Vulqar söz aşkarlandı",
-              body: clip(`${req.user.fullName}: ${offendingPreview}`),
-              type: "ADMIN_VULGAR",
-            },
-          });
-          adminNotifs.push({ adminId: a.id, notif: n });
-        }
+        await notifyAdmins(prisma, req.app.get("io"), {
+          title: "Vulqar söz aşkarlandı",
+          body: `${req.user.fullName}: ${offendingPreview}`,
+          type: "ADMIN_VULGAR",
+          telegramText: `🤬 Vulqar söz\nUser: ${req.user.fullName}\nText: ${offendingPreview}`,
+        });
       }
 
       // Determine receiver
@@ -416,9 +399,7 @@ export function conversationsRouter(prisma: PrismaClient) {
         }
         io.to(`user:${receiverId}`).emit("new_notification", notif);
 
-        for (const a of adminNotifs) {
-          io.to(`user:${a.adminId}`).emit("new_notification", a.notif);
-        }
+        // notifyAdmins already emitted sockets
       }
 
       res.json(msg);
