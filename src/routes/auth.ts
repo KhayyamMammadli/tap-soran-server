@@ -126,11 +126,30 @@ export function authRouter(prisma: PrismaClient) {
         <p style="color:#777; font-size: 12px;">Əgər bunu siz etməmisinizsə, bu emaili nəzərə almayın.</p>
       </div>
     `;
-    await sendMail({ to: emailNorm, subject, text, html });
+const mail = await sendMail({ to: emailNorm, subject, text, html });
 
-    // If SMTP isn't configured, return code for testing in dev.
-    const debug = !isSmtpConfigured() && process.env.NODE_ENV !== "production";
-    res.json({ ok: true, expiresAt, ...(debug ? { debugCode: code } : {}) });
+// Debug mode: return code for testing (disable in production!).
+const debug =
+  process.env.OTP_DEBUG_RETURN_CODE === "1" || (!isSmtpConfigured() && process.env.NODE_ENV !== "production");
+
+if (!mail.sent) {
+  if (debug) {
+    return res.json({
+      ok: true,
+      expiresAt,
+      debugCode: code,
+      mailSkipped: "skipped" in mail ? mail.skipped : false,
+      mailReason: "reason" in mail ? mail.reason : undefined,
+    });
+  }
+  return res.status(500).json({
+    error: mail.skipped
+      ? "SMTP quraşdırılmayıb. Render Environment-də SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM əlavə edin."
+      : "OTP email göndərmək alınmadı. SMTP məlumatlarını yoxlayın (Render logs-da sendMail failed).",
+  });
+}
+
+res.json({ ok: true, expiresAt });
   });
 
   r.post("/register/resend-otp", async (req, res) => {
@@ -162,10 +181,29 @@ export function authRouter(prisma: PrismaClient) {
         <p style="color:#555">Kod 10 dəqiqə keçərlidir.</p>
       </div>
     `;
-    await sendMail({ to: emailNorm, subject, text, html });
+const mail = await sendMail({ to: emailNorm, subject, text, html });
 
-    const debug = !isSmtpConfigured() && process.env.NODE_ENV !== "production";
-    res.json({ ok: true, expiresAt, ...(debug ? { debugCode: code } : {}) });
+const debug =
+  process.env.OTP_DEBUG_RETURN_CODE === "1" || (!isSmtpConfigured() && process.env.NODE_ENV !== "production");
+
+if (!mail.sent) {
+  if (debug) {
+    return res.json({
+      ok: true,
+      expiresAt,
+      debugCode: code,
+      mailSkipped: "skipped" in mail ? mail.skipped : false,
+      mailReason: "reason" in mail ? mail.reason : undefined,
+    });
+  }
+  return res.status(500).json({
+    error: mail.skipped
+      ? "SMTP quraşdırılmayıb. Render Environment-də SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM əlavə edin."
+      : "OTP email göndərmək alınmadı. SMTP məlumatlarını yoxlayın (Render logs-da sendMail failed).",
+  });
+}
+
+res.json({ ok: true, expiresAt });
   });
 
   r.post("/register/verify-otp", async (req, res) => {
