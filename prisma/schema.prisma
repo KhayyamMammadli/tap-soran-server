@@ -106,6 +106,20 @@ model User {
   createdAt DateTime @default(now())
 }
 
+/// Temporary storage for email OTP verification during registration.
+/// Stores only hashed OTP and a JSON payload (including passwordHash), never the plain password.
+model EmailOtp {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  codeHash  String
+  payload   Json
+  expiresAt DateTime
+  attempts  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([expiresAt])
+}
+
 model SellerReview {
   id        String   @id @default(cuid())
 
