@@ -13,6 +13,14 @@ enum Role {
   SUPER_ADMIN
 }
 
+/// Seller preference for item condition.
+/// (Used for matching when buyer provides a condition/budget; kept optional for backward-compat.)
+enum ConditionPref {
+  ANY
+  NEW
+  USED
+}
+
 enum RequestScope {
   ALL_SELLERS
   CATEGORY_SELLERS
@@ -41,6 +49,7 @@ model Category {
   id       String   @id @default(cuid())
   name     String   @unique
   users    User[]
+  sellerCategories SellerCategory[]
   requests Request[]
 }
 
@@ -51,6 +60,10 @@ model User {
   email        String   @unique
   passwordHash String
   tip          String?
+
+  /// Optional location fields (used for smart matching)
+  city         String?
+  district     String?
 
   // Contact info (required for SELLER: at least one of phone/whatsapp)
   phone        String?
@@ -71,8 +84,20 @@ model User {
   categoryId   String?
   category     Category? @relation(fields: [categoryId], references: [id])
 
+  /// Multi-category support for sellers (backward-compatible with categoryId)
+  sellerCategories SellerCategory[]
+
+  /// Seller matching preferences
+  sellerMinPrice Int?
+  sellerMaxPrice Int?
+  sellerCondition ConditionPref @default(ANY)
+
+  /// Monetization flags (used later)
+  isPremium Boolean @default(false)
+
   buyerRequests      Request[]         @relation("BuyerRequests")
   acceptedRequests   AcceptedRequest[]
+  requestTargets     RequestTarget[]
   conversationsA     Conversation[]    @relation("ConvA")
   conversationsB     Conversation[]    @relation("ConvB")
   messages           Message[]
@@ -226,6 +251,13 @@ model Request {
   imageUrl   String?
   scope      RequestScope
 
+  /// Optional location for smart matching (if not provided, can be inferred from buyer profile)
+  city       String?
+  district   String?
+
+  /// Optional budget (AZN) - used for smart matching (optional)
+  budget     Int?
+
   /// Category is required only when scope=CATEGORY_SELLERS.
   /// When scope=ALL_SELLERS, category can be null.
   categoryId String?
@@ -238,9 +270,35 @@ model Request {
   complaints UserComplaint[] @relation("ComplaintRequest")
 
   accepted   AcceptedRequest?
+  targets    RequestTarget[]
   completedAt DateTime?
   review      SellerReview?
   createdAt  DateTime     @default(now())
+}
+
+/// Join table: which sellers were targeted for a given request.
+/// This reduces spam and enables response-rate analytics later.
+model RequestTarget {
+  requestId String
+  sellerId  String
+  request   Request @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  seller    User    @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([requestId, sellerId])
+  @@index([sellerId, createdAt])
+}
+
+/// Join table: sellers can work across multiple categories.
+model SellerCategory {
+  sellerId   String
+  categoryId String
+  seller     User     @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  category   Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+
+  @@id([sellerId, categoryId])
+  @@index([categoryId])
 }
 
 model AcceptedRequest {

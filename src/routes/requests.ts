@@ -7,6 +7,32 @@ import { notifyAdmins } from "../utils/adminNotify";
 
 const upload = multer({ dest: process.env.UPLOAD_DIR || "uploads" });
 
+function pushPrefs(u: {
+  pushSoundEnabled?: boolean | null;
+  pushSound?: "DEFAULT" | "CHIME" | "DING" | "POP" | null;
+}) {
+  const enabled = u.pushSoundEnabled !== false;
+  const channelId = !enabled
+    ? "silent"
+    : u.pushSound === "CHIME"
+      ? "sound_chime"
+      : u.pushSound === "DING"
+        ? "sound_ding"
+        : u.pushSound === "POP"
+          ? "sound_pop"
+          : "default";
+  const sound = !enabled
+    ? null
+    : u.pushSound === "CHIME"
+      ? "chime.wav"
+      : u.pushSound === "DING"
+        ? "ding.wav"
+        : u.pushSound === "POP"
+          ? "pop.wav"
+          : "default";
+  return { channelId, sound };
+}
+
 export function requestsRouter(prisma: PrismaClient) {
   const r = Router();
 
@@ -53,6 +79,10 @@ export function requestsRouter(prisma: PrismaClient) {
       // When scope=ALL_SELLERS, categoryId is optional.
       categoryId: z.string().optional(),
       scope: z.enum(["ALL_SELLERS", "CATEGORY_SELLERS"]),
+      // Optional: used for smart seller matching
+      city: z.string().trim().min(1).max(64).optional(),
+      district: z.string().trim().min(1).max(64).optional(),
+      budget: z.coerce.number().int().positive().optional(),
     });
 
     const parsed = schema.safeParse(req.body);
@@ -75,12 +105,31 @@ export function requestsRouter(prisma: PrismaClient) {
       }
     }
 
+    // Infer location from buyer profile (optional)
+    let city: string | null = parsed.data.city?.trim() || null;
+    let district: string | null = parsed.data.district?.trim() || null;
+    if (!city || !district) {
+      try {
+        const buyer = await prisma.user.findUnique({
+          where: { id: req.user.id },
+          select: { city: true, district: true },
+        });
+        if (!city) city = (buyer as any)?.city ?? null;
+        if (!district) district = (buyer as any)?.district ?? null;
+      } catch {}
+    }
+
+    const budget = typeof (parsed.data as any).budget === "number" ? (parsed.data as any).budget : null;
+
     const request = await prisma.request.create({
       data: {
         title: parsed.data.title,
         categoryId,
         scope,
         imageUrl,
+        city,
+        district,
+        budget,
         buyerId: req.user.id,
       },
       include: { category: true, buyer: { select: { id: true, fullName: true, avatarUrl: true } } },
@@ -97,15 +146,90 @@ export function requestsRouter(prisma: PrismaClient) {
       });
     } catch {}
 
-    // socket notification
-    const io = req.app.get("io");
-    if (io) {
-      if (request.scope === "ALL_SELLERS") {
-        io.to("sellers:all").emit("new_request", request);
-      } else {
-        // CATEGORY_SELLERS must have categoryId
-        if (request.categoryId) io.to(`sellers:cat:${request.categoryId}`).emit("new_request", request);
+    // Smart Seller Matching + targeted delivery (reduces spam)
+    try {
+      const baseWhere: any = { role: "SELLER", blocked: false };
+      if (request.scope === "CATEGORY_SELLERS" && request.categoryId) {
+        baseWhere.OR = [
+          { categoryId: request.categoryId },
+          { sellerCategories: { some: { categoryId: request.categoryId } } },
+        ];
       }
+
+      const sellers = await prisma.user.findMany({
+        where: baseWhere,
+        select: {
+          id: true,
+          city: true,
+          district: true,
+          sellerMinPrice: true,
+          sellerMaxPrice: true,
+          expoPushToken: true,
+          pushEnabled: true,
+          pushSoundEnabled: true,
+          pushSound: true,
+        },
+      });
+
+      const matched = (sellers || []).filter((s: any) => {
+        // Location: if seller set a city/district, require match when request location exists.
+        if (s.city && request.city && String(s.city).toLowerCase() !== String(request.city).toLowerCase()) return false;
+        if (s.district && request.district && String(s.district).toLowerCase() !== String(request.district).toLowerCase()) return false;
+
+        // Budget: if buyer provided budget and seller set min/max, enforce range
+        if (typeof request.budget === "number") {
+          if (typeof s.sellerMinPrice === "number" && request.budget < s.sellerMinPrice) return false;
+          if (typeof s.sellerMaxPrice === "number" && request.budget > s.sellerMaxPrice) return false;
+        }
+        return true;
+      });
+
+      if (matched.length) {
+        // Persist targeting for analytics + better feeds
+        await prisma.requestTarget.createMany({
+          data: matched.map((s: any) => ({ requestId: request.id, sellerId: s.id })),
+          skipDuplicates: true,
+        });
+
+        // In-app notifications (best-effort)
+        try {
+          await prisma.notification.createMany({
+            data: matched.map((s: any) => ({
+              userId: s.id,
+              title: "Yeni sorğu",
+              body: request.title,
+              type: "NEW_REQUEST",
+              data: { requestId: request.id },
+            })),
+          });
+        } catch {}
+
+        // Socket delivery (targeted)
+        const io = req.app.get("io");
+        if (io) {
+          for (const s of matched) {
+            io.to(`user:${s.id}`).emit("new_request", request);
+          }
+        }
+
+        // Push (targeted)
+        await Promise.all(
+          matched
+            .filter((s: any) => s.pushEnabled !== false && !!s.expoPushToken)
+            .map(async (s: any) => {
+              const { channelId, sound } = pushPrefs(s);
+              await sendExpoPush(
+                s.expoPushToken,
+                "Yeni sorğu",
+                request.title,
+                { type: "NEW_REQUEST", requestId: request.id },
+                { sound, channelId }
+              );
+            })
+        );
+      }
+    } catch (e) {
+      console.error("Seller matching/notify failed:", e);
     }
 
     res.json(request);
@@ -125,8 +249,17 @@ export function requestsRouter(prisma: PrismaClient) {
     const requests = await prisma.request.findMany({
       where: {
         OR: [
-          { scope: "ALL_SELLERS" },
-          { scope: "CATEGORY_SELLERS", categoryId: req.user.categoryId || "__none__" },
+          // New behavior: only show requests that targeted this seller.
+          { targets: { some: { sellerId: req.user.id } } },
+
+          // Backward-compatible behavior: legacy requests (no targets) follow the old scope rules.
+          {
+            targets: { none: {} },
+            OR: [
+              { scope: "ALL_SELLERS" },
+              { scope: "CATEGORY_SELLERS", categoryId: req.user.categoryId || "__none__" },
+            ],
+          },
         ],
       },
       include: { category: true, buyer: { select: { id: true, fullName: true, avatarUrl: true } }, accepted: true, review: true },
@@ -155,6 +288,18 @@ export function requestsRouter(prisma: PrismaClient) {
     });
     if (!reqRow) return res.status(404).json({ error: "Not found" });
     if (reqRow.accepted) return res.status(409).json({ error: "Already accepted" });
+
+    // If this request was targeted to sellers, ensure the current seller was one of them.
+    try {
+      const targetsCount = await prisma.requestTarget.count({ where: { requestId } });
+      if (targetsCount > 0) {
+        const t = await prisma.requestTarget.findUnique({
+          where: { requestId_sellerId: { requestId, sellerId: req.user.id } },
+          select: { requestId: true },
+        });
+        if (!t) return res.status(403).json({ error: "Bu sorğu sizə göndərilməyib" });
+      }
+    } catch {}
 
     // Enforce request visibility rules for acceptance
     if (reqRow.scope === "CATEGORY_SELLERS" && reqRow.categoryId !== (req.user.categoryId || "__none__")) {

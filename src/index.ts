@@ -212,6 +212,7 @@ io.use(async (socket, next) => {
         blockedAt: true,
         blockedUntil: true,
         category: { select: { id: true } },
+        sellerCategories: { select: { categoryId: true } },
       },
     });
     if (!user) return next(new Error("User not found"));
@@ -238,6 +239,11 @@ io.use(async (socket, next) => {
       role: user.role,
       tokenVersion: (user as any).tokenVersion ?? 0,
       categoryId: user.category?.id ?? null,
+      categoryIds: Array.isArray((user as any).sellerCategories)
+        ? (user as any).sellerCategories.map((x: any) => x.categoryId)
+        : (user as any).category?.id
+          ? [(user as any).category.id]
+          : [],
     };
     next();
   } catch {
@@ -246,12 +252,13 @@ io.use(async (socket, next) => {
 });
 
 io.on("connection", (socket) => {
-  const user = (socket as any).user as { id: string; role: Role; categoryId?: string | null };
+  const user = (socket as any).user as { id: string; role: Role; categoryId?: string | null; categoryIds?: string[] };
   socket.join(`user:${user.id}`);
 
   if (user.role === "SELLER") {
     socket.join("sellers:all");
-    if (user.categoryId) socket.join(`sellers:cat:${user.categoryId}`);
+    const cats = (user.categoryIds && user.categoryIds.length ? user.categoryIds : user.categoryId ? [user.categoryId] : []).filter(Boolean) as string[];
+    for (const cid of cats) socket.join(`sellers:cat:${cid}`);
   }
 
   socket.on("disconnect", () => {});

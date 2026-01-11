@@ -286,7 +286,13 @@ res.json({ ok: true, expiresAt });
         fullName,
         email: emailNorm,
         passwordHash,
-        ...(role === "SELLER" ? { category: { connect: { id: categoryId! } } } : {}),
+        ...(role === "SELLER"
+          ? {
+              category: { connect: { id: categoryId! } },
+              // multi-category seed (backward-compatible)
+              sellerCategories: { create: { categoryId: categoryId! } },
+            }
+          : {}),
         phone: role === "SELLER" ? (phone?.toString().trim() || null) : null,
         whatsapp: role === "SELLER" ? (whatsapp?.toString().trim() || null) : null,
       },
@@ -357,7 +363,13 @@ r.post("/register", async (req, res) => {
         fullName,
         email: emailNorm,
         passwordHash,
-        ...(role === "SELLER" ? { category: { connect: { id: categoryId! } } } : {}),
+        ...(role === "SELLER"
+          ? {
+              category: { connect: { id: categoryId! } },
+              // multi-category seed (backward-compatible)
+              sellerCategories: { create: { categoryId: categoryId! } },
+            }
+          : {}),
         phone: role === "SELLER" ? (phone?.trim() || null) : null,
         whatsapp: role === "SELLER" ? (whatsapp?.trim() || null) : null,
       },

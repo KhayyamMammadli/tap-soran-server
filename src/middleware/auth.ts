@@ -24,6 +24,7 @@ export function authMiddleware(prisma: PrismaClient, opts?: { allowBlocked?: boo
           blockedAt: true,
           blockedUntil: true,
           category: { select: { id: true } },
+          sellerCategories: { select: { categoryId: true } },
         },
       });
       if (!user) return res.status(401).json({ error: "Unauthorized" });
@@ -68,6 +69,11 @@ export function authMiddleware(prisma: PrismaClient, opts?: { allowBlocked?: boo
         email: user.email,
         tip: user.tip,
         categoryId: user.category?.id ?? null,
+        categoryIds: Array.isArray((user as any).sellerCategories)
+          ? (user as any).sellerCategories.map((x: any) => x.categoryId)
+          : (user as any).category?.id
+            ? [(user as any).category.id]
+            : [],
       };
 
       next();

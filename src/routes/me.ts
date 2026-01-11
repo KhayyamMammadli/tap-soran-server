@@ -47,6 +47,7 @@ export function meRouter(prisma: PrismaClient) {
         blockedReason: true,
         blockedAt: true,
         category: { select: { id: true } },
+        sellerCategories: { select: { categoryId: true } },
       },
     });
 
@@ -59,6 +60,7 @@ export function meRouter(prisma: PrismaClient) {
       email: user.email,
       tip: user.tip,
       categoryId: user.category?.id ?? null,
+      categoryIds: (user.sellerCategories || []).map((x) => x.categoryId),
       avatarUrl: user.avatarUrl ?? null,
       blocked: user.blocked,
       blockedReason: user.blockedReason,
@@ -159,6 +161,87 @@ export function meRouter(prisma: PrismaClient) {
       where: { id: req.user!.id },
       data,
     });
+
+    return res.json({ ok: true });
+  });
+
+  // =========================
+  // Seller profile (Smart Matching)
+  // =========================
+  r.get("/seller-profile", async (req, res) => {
+    if (req.user!.role !== "SELLER") return res.status(403).json({ error: "Only sellers" });
+
+    const user = await prisma.user.findUnique({
+      where: { id: req.user!.id },
+      select: {
+        id: true,
+        city: true,
+        district: true,
+        sellerMinPrice: true,
+        sellerMaxPrice: true,
+        sellerCondition: true,
+        isPremium: true,
+        category: { select: { id: true } },
+        sellerCategories: { select: { categoryId: true } },
+      },
+    });
+
+    if (!user) return res.status(404).json({ error: "Not found" });
+    const categoryIds = (user.sellerCategories || []).map((x) => x.categoryId);
+    return res.json({
+      id: user.id,
+      city: user.city ?? null,
+      district: user.district ?? null,
+      sellerMinPrice: user.sellerMinPrice ?? null,
+      sellerMaxPrice: user.sellerMaxPrice ?? null,
+      sellerCondition: user.sellerCondition ?? "ANY",
+      isPremium: user.isPremium ?? false,
+      categoryIds: categoryIds.length ? categoryIds : user.category?.id ? [user.category.id] : [],
+    });
+  });
+
+  r.patch("/seller-profile", async (req, res) => {
+    if (req.user!.role !== "SELLER") return res.status(403).json({ error: "Only sellers" });
+
+    const schema = z.object({
+      city: z.string().trim().min(1).max(64).optional().nullable(),
+      district: z.string().trim().min(1).max(64).optional().nullable(),
+      sellerMinPrice: z.coerce.number().int().min(0).optional().nullable(),
+      sellerMaxPrice: z.coerce.number().int().min(0).optional().nullable(),
+      sellerCondition: z.enum(["ANY", "NEW", "USED"]).optional().nullable(),
+      categoryIds: z.array(z.string().min(1)).min(1).optional(),
+    });
+
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+    const data: any = {};
+    if (parsed.data.city !== undefined) data.city = parsed.data.city ? String(parsed.data.city).trim() : null;
+    if (parsed.data.district !== undefined) data.district = parsed.data.district ? String(parsed.data.district).trim() : null;
+    if (parsed.data.sellerMinPrice !== undefined) data.sellerMinPrice = parsed.data.sellerMinPrice === null ? null : parsed.data.sellerMinPrice;
+    if (parsed.data.sellerMaxPrice !== undefined) data.sellerMaxPrice = parsed.data.sellerMaxPrice === null ? null : parsed.data.sellerMaxPrice;
+    if (parsed.data.sellerCondition !== undefined) data.sellerCondition = parsed.data.sellerCondition ?? null;
+
+    // Validate and update categories (multi-select)
+    if (parsed.data.categoryIds) {
+      const unique = Array.from(new Set(parsed.data.categoryIds)).filter(Boolean);
+      const cats = await prisma.category.findMany({ where: { id: { in: unique } }, select: { id: true } });
+      if (cats.length !== unique.length) return res.status(400).json({ error: "Kateqoriya tapılmadı" });
+
+      // Keep backward compatibility: store first selected category in User.categoryId relation
+      data.category = { connect: { id: unique[0] } };
+
+      await prisma.$transaction([
+        prisma.user.update({ where: { id: req.user!.id }, data }),
+        prisma.sellerCategory.deleteMany({ where: { sellerId: req.user!.id } }),
+        prisma.sellerCategory.createMany({
+          data: unique.map((categoryId) => ({ sellerId: req.user!.id, categoryId })),
+          skipDuplicates: true,
+        }),
+      ]);
+    } else {
+      await prisma.user.update({ where: { id: req.user!.id }, data });
+    }
 
     return res.json({ ok: true });
   });

@@ -10,6 +10,7 @@ declare global {
         email: string;
         tip?: string | null;
         categoryId?: string | null;
+        categoryIds?: string[];
       };
     }
   }
