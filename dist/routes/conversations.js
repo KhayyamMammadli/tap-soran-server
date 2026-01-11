@@ -1,0 +1,379 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.conversationsRouter = conversationsRouter;
+const client_1 = require("@prisma/client");
+const express_1 = require("express");
+const zod_1 = require("zod");
+const multer_1 = __importDefault(require("multer"));
+const path_1 = __importDefault(require("path"));
+const fs_1 = __importDefault(require("fs"));
+const push_1 = require("../utils/push");
+const moderation_1 = require("../utils/moderation");
+const safety_1 = require("../utils/safety");
+const adminNotify_1 = require("../utils/adminNotify");
+function ensureDir(p) {
+    if (!fs_1.default.existsSync(p))
+        fs_1.default.mkdirSync(p, { recursive: true });
+}
+function conversationsRouter(prisma) {
+    const r = (0, express_1.Router)();
+    // Upload setup for chat media (images/audio)
+    const uploadRoot = process.env.UPLOAD_DIR || "uploads";
+    const chatRoot = path_1.default.join(uploadRoot, "chat");
+    const imgDir = path_1.default.join(chatRoot, "images");
+    const audioDir = path_1.default.join(chatRoot, "audio");
+    ensureDir(imgDir);
+    ensureDir(audioDir);
+    const chatUpload = (0, multer_1.default)({
+        storage: multer_1.default.diskStorage({
+            destination: (_req, file, cb) => {
+                if (file.fieldname === "image")
+                    return cb(null, imgDir);
+                if (file.fieldname === "audio")
+                    return cb(null, audioDir);
+                return cb(null, chatRoot);
+            },
+            filename: (req, file, cb) => {
+                const ext = (path_1.default.extname(file.originalname) || "").toLowerCase();
+                const safeExt = ext && ext.length <= 10 ? ext : "";
+                const rand = Math.random().toString(16).slice(2);
+                cb(null, `${req.user.id}-${Date.now()}-${rand}${safeExt}`);
+            },
+        }),
+        limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
+        fileFilter: (_req, file, cb) => {
+            if (file.fieldname === "image") {
+                if (!file.mimetype.startsWith("image/"))
+                    return cb(new Error("Only image files allowed"));
+            }
+            if (file.fieldname === "audio") {
+                if (!file.mimetype.startsWith("audio/"))
+                    return cb(new Error("Only audio files allowed"));
+            }
+            cb(null, true);
+        },
+    });
+    // List conversations (for current user) with request preview if exists
+    r.get("/", async (req, res) => {
+        if (!req.user)
+            return res.status(401).json({ error: "Unauthorized" });
+        const convs = await prisma.conversation.findMany({
+            where: { OR: [{ userAId: req.user.id }, { userBId: req.user.id }] },
+            orderBy: { createdAt: "desc" },
+            include: {
+                userA: { select: { id: true, fullName: true, role: true, avatarUrl: true } },
+                userB: { select: { id: true, fullName: true, role: true, avatarUrl: true } },
+                acceptedRequest: {
+                    include: {
+                        request: { include: { category: true, buyer: { select: { id: true, fullName: true, avatarUrl: true } } } },
+                        seller: { select: { id: true, fullName: true, avatarUrl: true } },
+                    },
+                },
+                messages: { orderBy: { createdAt: "desc" }, take: 1 },
+            },
+        });
+        res.json(convs);
+    });
+    // Conversation details (for showing request image/title in Chat)
+    r.get("/:id", async (req, res) => {
+        if (!req.user)
+            return res.status(401).json({ error: "Unauthorized" });
+        const id = req.params.id;
+        const conv = await prisma.conversation.findUnique({
+            where: { id },
+            include: {
+                userA: { select: { id: true, fullName: true, role: true, avatarUrl: true } },
+                userB: { select: { id: true, fullName: true, role: true, avatarUrl: true } },
+                acceptedRequest: {
+                    include: {
+                        request: {
+                            include: {
+                                category: true,
+                                buyer: { select: { id: true, fullName: true, avatarUrl: true } },
+                            },
+                        },
+                        seller: { select: { id: true, fullName: true, avatarUrl: true } },
+                    },
+                },
+            },
+        });
+        if (!conv)
+            return res.status(404).json({ error: "Not found" });
+        if (conv.userAId !== req.user.id && conv.userBId !== req.user.id)
+            return res.status(403).json({ error: "Forbidden" });
+        res.json(conv);
+    });
+    // Get messages
+    r.get("/:id/messages", async (req, res) => {
+        if (!req.user)
+            return res.status(401).json({ error: "Unauthorized" });
+        const id = req.params.id;
+        const conv = await prisma.conversation.findUnique({ where: { id } });
+        if (!conv)
+            return res.status(404).json({ error: "Not found" });
+        if (conv.userAId !== req.user.id && conv.userBId !== req.user.id)
+            return res.status(403).json({ error: "Forbidden" });
+        const msgs = await prisma.message.findMany({
+            where: { conversationId: id },
+            orderBy: { createdAt: "asc" },
+            take: 500,
+        });
+        res.json(msgs);
+    });
+    // Send message (text OR image OR audio)
+    r.post("/:id/messages", chatUpload.fields([
+        { name: "image", maxCount: 1 },
+        { name: "audio", maxCount: 1 },
+    ]), async (req, res) => {
+        if (!req.user)
+            return res.status(401).json({ error: "Unauthorized" });
+        // Check if sender's chat is temporarily frozen
+        const id = req.params.id;
+        const sender = await prisma.user.findUnique({
+            where: { id: req.user.id },
+            select: { id: true, fullName: true, chatFrozenUntil: true, moderationStrikes: true, blocked: true },
+        });
+        if (!sender)
+            return res.status(401).json({ error: "Unauthorized" });
+        if (sender.blocked)
+            return res.status(403).json({ error: "Blocked" });
+        if (sender.chatFrozenUntil && sender.chatFrozenUntil.getTime() > Date.now()) {
+            return res.status(423).json({ error: "ChatFrozen", until: sender.chatFrozenUntil.toISOString() });
+        }
+        const conv = await prisma.conversation.findUnique({ where: { id } });
+        if (!conv)
+            return res.status(404).json({ error: "Not found" });
+        if (conv.userAId !== req.user.id && conv.userBId !== req.user.id)
+            return res.status(403).json({ error: "Forbidden" });
+        const files = (req.files || {});
+        const img = files.image?.[0];
+        const aud = files.audio?.[0];
+        const textRaw = typeof req.body?.text === "string" ? req.body.text : "";
+        const text = textRaw.trim();
+        let type = client_1.MessageType.TEXT;
+        let mediaUrl = null;
+        let mediaMime = null;
+        let mediaDuration = null;
+        let finalText = null;
+        // Vulgarity moderation (server-side). We store a masked version of the text.
+        // Client-side checks can be bypassed, so server enforcement is required.
+        let vulgarDetected = false;
+        let vulgarOriginal = null;
+        if (img) {
+            type = client_1.MessageType.IMAGE;
+            mediaUrl = `/uploads/chat/images/${img.filename}`;
+            mediaMime = img.mimetype || null;
+            finalText = text || null; // optional caption
+        }
+        else if (aud) {
+            type = client_1.MessageType.AUDIO;
+            mediaUrl = `/uploads/chat/audio/${aud.filename}`;
+            mediaMime = aud.mimetype || null;
+            const durRaw = typeof req.body?.duration === "string" ? req.body.duration : undefined;
+            const dur = durRaw ? Number(durRaw) : NaN;
+            mediaDuration = Number.isFinite(dur) && dur > 0 ? Math.floor(dur) : null;
+            finalText = text || null;
+        }
+        else {
+            // Plain text
+            const schema = zod_1.z.object({ text: zod_1.z.string().min(1) });
+            const parsed = schema.safeParse({ text });
+            if (!parsed.success)
+                return res.status(400).json({ error: parsed.error.flatten() });
+            type = client_1.MessageType.TEXT;
+            finalText = text;
+        }
+        // Apply server-side profanity masking for any user-provided text
+        // (plain text messages and optional captions).
+        if (finalText && (0, moderation_1.hasAzVulgar)(finalText)) {
+            vulgarDetected = true;
+            vulgarOriginal = finalText;
+            finalText = (0, moderation_1.censorAzVulgar)(finalText);
+        }
+        // Safety moderation: block illegal trade/contact/link content (server-side)
+        if (finalText) {
+            const safety = (0, safety_1.checkChatSafety)(finalText);
+            if (!safety.ok) {
+                // Log event + strike escalation
+                const strike = (sender.moderationStrikes || 0) + 1;
+                const reasonLabel = (0, safety_1.humanizeSafetyReason)(safety.code);
+                const sys = await prisma.$transaction(async (tx) => {
+                    await tx.moderationEvent.create({
+                        data: {
+                            userId: sender.id,
+                            conversationId: id,
+                            messageText: finalText.slice(0, 500),
+                            reasonCode: safety.code,
+                        },
+                    });
+                    // Escalation policy: 1st = warning; 2nd = 24h freeze; 3rd = block
+                    if (strike >= 3) {
+                        await tx.user.update({
+                            where: { id: sender.id },
+                            data: {
+                                moderationStrikes: strike,
+                                blocked: true,
+                                blockedReason: `Təhlükəsizlik qaydalarının pozulması: ${reasonLabel}`,
+                                blockedAt: new Date(),
+                                tokenVersion: { increment: 1 },
+                            },
+                        });
+                    }
+                    else if (strike === 2) {
+                        await tx.user.update({
+                            where: { id: sender.id },
+                            data: {
+                                moderationStrikes: strike,
+                                chatFrozenUntil: new Date(Date.now() + 24 * 60 * 60 * 1000),
+                            },
+                        });
+                    }
+                    else {
+                        await tx.user.update({ where: { id: sender.id }, data: { moderationStrikes: strike } });
+                    }
+                    // Insert a SYSTEM warning into the conversation
+                    const sysMsg = await tx.message.create({
+                        data: {
+                            conversationId: id,
+                            senderId: sender.id,
+                            type: client_1.MessageType.SYSTEM,
+                            text: strike >= 3
+                                ? `⛔ Hesab bloklandı. Səbəb: ${reasonLabel}`
+                                : strike === 2
+                                    ? `⛔ Qadağan olunmuş məzmun aşkarlandı (${reasonLabel}). Çat 24 saatlıq donduruldu.`
+                                    : `⚠️ Qadağan olunmuş məzmun aşkarlandı (${reasonLabel}). Təkrar etsəniz hesabınız bloklana bilər.`,
+                        },
+                    });
+                    return sysMsg;
+                });
+                // Emit the SYSTEM warning into the live chat
+                const ioLive = req.app.get("io");
+                try {
+                    ioLive?.to?.(`user:${conv.userAId}`)?.to?.(`user:${conv.userBId}`)?.emit?.("new_message", sys);
+                }
+                catch { }
+                // Notify super admins + Telegram
+                const offendingPreview = (0, push_1.clip)(finalText);
+                await (0, adminNotify_1.notifyAdmins)(prisma, ioLive, {
+                    title: "Chat təhlükəsizlik xəbərdarlığı",
+                    body: `${sender.fullName}: ${reasonLabel} • ${offendingPreview}`,
+                    type: "ADMIN_SAFETY",
+                    telegramText: `⚠️ Təhlükəsizlik riski\nUser: ${sender.fullName}\nReason: ${reasonLabel}\nText: ${offendingPreview}`,
+                });
+                // Socket updates (kick on block, or inform freeze)
+                const io = req.app.get("io");
+                if (io) {
+                    // deliver system warning to both participants
+                    try {
+                        io.to(`user:${conv.userAId}`).to(`user:${conv.userBId}`).emit("new_message", sys);
+                    }
+                    catch { }
+                    // notifyAdmins already emitted sockets
+                    // Re-read sender to know if blocked/frozen
+                    const u = await prisma.user.findUnique({ where: { id: sender.id }, select: { blocked: true, blockedReason: true, blockedAt: true, chatFrozenUntil: true } });
+                    if (u?.blocked) {
+                        io.to(`user:${sender.id}`).emit("userBlocked", { reason: u.blockedReason, blockedAt: u.blockedAt?.toISOString() });
+                        io.in(`user:${sender.id}`).disconnectSockets(true);
+                    }
+                    else if (u?.chatFrozenUntil) {
+                        io.to(`user:${sender.id}`).emit("chatFrozen", { until: u.chatFrozenUntil.toISOString(), reason: reasonLabel });
+                    }
+                }
+                return res.status(422).json({ error: "MessageBlocked", reasonCode: safety.code, reason: reasonLabel });
+            }
+        }
+        const msg = await prisma.message.create({
+            data: {
+                conversationId: id,
+                senderId: req.user.id,
+                type,
+                text: finalText,
+                mediaUrl,
+                mediaMime,
+                mediaDuration,
+            },
+        });
+        // If we detected vulgarity, create a SYSTEM warning message in the chat
+        // and notify SUPER_ADMIN users.
+        let systemMsg = null;
+        if (vulgarDetected) {
+            systemMsg = await prisma.message.create({
+                data: {
+                    conversationId: id,
+                    senderId: req.user.id,
+                    type: client_1.MessageType.SYSTEM,
+                    text: "⚠️ Vulqar ifadə aşkarlandı. Davam etsəniz hesabınız blok olunacaq.",
+                },
+            });
+            const offendingPreview = (0, push_1.clip)((0, moderation_1.censorAzVulgar)(vulgarOriginal || ""));
+            await (0, adminNotify_1.notifyAdmins)(prisma, req.app.get("io"), {
+                title: "Vulqar söz aşkarlandı",
+                body: `${req.user.fullName}: ${offendingPreview}`,
+                type: "ADMIN_VULGAR",
+                telegramText: `🤬 Vulqar söz\nUser: ${req.user.fullName}\nText: ${offendingPreview}`,
+            });
+        }
+        // Determine receiver
+        const receiverId = conv.userAId === req.user.id ? conv.userBId : conv.userAId;
+        // Create notification for receiver (in-app) + push
+        const preview = type === client_1.MessageType.TEXT
+            ? (0, push_1.clip)(finalText || "")
+            : type === client_1.MessageType.IMAGE
+                ? "📷 Şəkil"
+                : type === client_1.MessageType.AUDIO
+                    ? "🎤 Səs mesajı"
+                    : "Yeni mesaj";
+        const notif = await prisma.notification.create({
+            data: {
+                userId: receiverId,
+                title: "Yeni mesaj",
+                body: (0, push_1.clip)(`${req.user.fullName}: ${preview}`),
+                type: "MESSAGE",
+            },
+        });
+        const receiver = await prisma.user.findUnique({
+            where: { id: receiverId },
+            select: { expoPushToken: true, pushEnabled: true, pushSoundEnabled: true, pushSound: true },
+        });
+        const pushEnabled = receiver?.pushEnabled !== false && !!receiver?.expoPushToken;
+        if (pushEnabled) {
+            const channelId = !receiver.pushSoundEnabled
+                ? "silent"
+                : receiver.pushSound === "CHIME"
+                    ? "sound_chime"
+                    : receiver.pushSound === "DING"
+                        ? "sound_ding"
+                        : receiver.pushSound === "POP"
+                            ? "sound_pop"
+                            : "default";
+            const sound = !receiver.pushSoundEnabled
+                ? null
+                : receiver.pushSound === "CHIME"
+                    ? "chime.wav"
+                    : receiver.pushSound === "DING"
+                        ? "ding.wav"
+                        : receiver.pushSound === "POP"
+                            ? "pop.wav"
+                            : "default";
+            await (0, push_1.sendExpoPush)(receiver.expoPushToken, notif.title, notif.body, {
+                type: "MESSAGE",
+                conversationId: id,
+                senderId: req.user.id,
+            }, { sound, channelId });
+        }
+        const io = req.app.get("io");
+        if (io) {
+            io.to(`user:${conv.userAId}`).to(`user:${conv.userBId}`).emit("new_message", msg);
+            if (systemMsg) {
+                io.to(`user:${conv.userAId}`).to(`user:${conv.userBId}`).emit("new_message", systemMsg);
+            }
+            io.to(`user:${receiverId}`).emit("new_notification", notif);
+            // notifyAdmins already emitted sockets
+        }
+        res.json(msg);
+    });
+    return r;
+}
